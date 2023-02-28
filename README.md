@@ -1,4 +1,4 @@
-# CheatSheetCompanion_Develop
+# CheatSheetCompanion
 
 ## About
 
