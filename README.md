@@ -47,12 +47,12 @@ Install-Package Microsoft.Web.WebView2 -Source nuget.org
 
 > In this file, you can change the global shortcuts.
 
-```
+```txt
 .\ini\config.ini
 ```
 
 example:
-```
+```ini
 [GlobalShortcut]
 AutoSwitch = ControlKey,ShiftKey,F2
 DisplayCompanion = ControlKey,ShiftKey,F11
@@ -62,7 +62,7 @@ DisplayCompanion = ControlKey,ShiftKey,F11
 
 > In this file, you can change the graphical appearance.
 
-```
+```txt
 .\styles\userstyle.css
 ```
 
@@ -70,7 +70,7 @@ The HTML Code will be generated within a body entity with the class "markdown-bo
 
 example:
 
-```
+```html
 <html>
 	<head>
 		<meta charset="UTF-8">
