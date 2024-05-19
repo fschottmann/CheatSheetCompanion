@@ -1004,3 +1004,23 @@
 .markdown-body ::-webkit-calendar-picker-indicator {
   filter: invert(50%);
 }
+
+.markdown-body .file-section {
+		margin-bottom: 20px;
+		padding: 10px;
+}
+
+.markdown-body .splitter {
+		border-bottom: 1px solid #ccc;
+		margin: 10px 0;
+}
+
+.markdown-body .file-header {
+		font-size: 0.9em;
+		color: #999;
+		margin-bottom: 5px;
+}
+
+.markdown-body p a {
+    display: block;
+  }

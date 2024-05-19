@@ -1,8 +1,8 @@
-﻿#Requires -Version 7
+#Requires -Version 7
 
 <#PSScriptInfo
 
-	.VERSION 1.0.0
+	.VERSION 2.0.0
 
 	.GUID 1a0524f5-edba-4780-b562-6097e428b673
 
@@ -10,7 +10,7 @@
 
 	.COMPANYNAME
 
-	.COPYRIGHT @2023 Frank Schottmann
+	.COPYRIGHT @2024 Frank Schottmann
 
 	.TAGS 
 
@@ -27,7 +27,15 @@
 	.EXTERNALSCRIPTDEPENDENCIES 
 
 	.RELEASENOTES
-    Version 1.1.0
+	Version 2.0.0
+	- Code cleanup, including bug fixes.
+	- Active check for new or changed markdown files (FileIndex).
+	- Added picture support.
+	- Active window grab starts automatically.
+	- Added CosineSimilarity to find suitable files.
+	- Displays which file was chosen for active window sync.
+	
+  Version 1.1.0
 	- code cleanup
     - add WebView2
 	Version 1.0.0
@@ -40,7 +48,6 @@
 	No matter what program or website the user is in, the appropriate cheat sheets are always displayed, making 
 	it easier for users to find the information they need quickly and efficiently.
 	
-	# https://cef-builds.spotifycdn.com/index.html
 #>
 
 
@@ -98,6 +105,282 @@ function Get-IniContent {
     
     }
 }
+
+function Get-FileHash {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$FolderPath,
+
+        [Parameter()]
+        [string[]]$Filter = @('*.md', '*.png', '*.gif')
+    )
+
+    $files = Get-ChildItem -Path $FolderPath -File -Recurse -Include $Filter
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hashObjects = @()
+
+    $files | ForEach-Object {
+        $file = $_
+        $fileStream = $file.OpenRead()
+        $hashBytes = $sha256.ComputeHash($fileStream)
+        $hashString = [System.BitConverter]::ToString($hashBytes).Replace("-", "")
+        $fileStream.Close()
+
+        $relativePath = $file.FullName.Replace($FolderPath + '\', '')
+
+        $hashObject = [PSCustomObject]@{
+            FileName     = $file.BaseName
+            Hash         = $hashString
+            RelativePath = $relativePath
+        }
+
+        $hashObjects += $hashObject
+    }
+
+    return $hashObjects
+}
+
+function Convert-ToWindowsFilename {
+    param (
+        [string]$filename
+    )
+
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+
+    $sanitizedFilename = $filename
+    foreach ($char in $invalidChars) {
+        $sanitizedFilename = $sanitizedFilename -replace [Regex]::Escape($char), '_'
+    }
+
+    $sanitizedFilename = $sanitizedFilename.TrimEnd('. ')
+
+    return $sanitizedFilename
+}
+
+function Convert-MarkdownToHtml {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$true)]
+        [System.IO.FileInfo]$MarkdownFile,
+
+        [Parameter(Mandatory=$true)]
+        [string]$OutputPath
+    )
+
+    $conversionType = [Microsoft.PowerShell.MarkdownRender.MarkdownConversionType]::HTML
+    $markdownOption = [Microsoft.PowerShell.MarkdownRender.PSMarkdownOptionInfo]::new()
+    $markdownContent = [System.IO.File]::ReadAllText($MarkdownFile.FullName)
+    $markdownConverter = [Microsoft.PowerShell.MarkdownRender.MarkdownConverter]
+    $markdownResult = $markdownConverter::Convert($markdownContent, $conversionType, $markdownOption)
+    $outputFilePath = Join-Path -Path $OutputPath -ChildPath ($MarkdownFile.BaseName + '.html')
+    $markdownResult.Html | Out-File $outputFilePath -Force
+}
+
+
+function Get-NGrams {
+    param (
+        [string] $inputString,
+        [int] $n
+    )
+
+    $inputString = -join ($inputString.ToLower() -replace '[^a-z0-9]', '')
+
+    $length = $inputString.Length
+    $ngrams = @()
+
+    for ($i = 0; $i -le $length - $n; $i++) {
+        $ngrams += $inputString.Substring($i, $n)
+    }
+
+    return $ngrams
+}
+
+function Get-CosineSimilarity {
+    param (
+        [string] $s,
+        [string] $t,
+        [int] $n
+    )
+
+    $sNGrams = Get-NGrams -inputString $s -n $n
+    $tNGrams = Get-NGrams -inputString $t -n $n
+
+    # Create frequency dictionaries
+    $sFreq = @{}
+    $tFreq = @{}
+
+    foreach ($gram in $sNGrams) {
+        if ($sFreq.ContainsKey($gram)) {
+            $sFreq[$gram]++
+        } else {
+            $sFreq[$gram] = 1
+        }
+    }
+
+    foreach ($gram in $tNGrams) {
+        if ($tFreq.ContainsKey($gram)) {
+            $tFreq[$gram]++
+        } else {
+            $tFreq[$gram] = 1
+        }
+    }
+
+    $intersection = 0
+
+    foreach ($gram in $sFreq.Keys) {
+        if ($tFreq.ContainsKey($gram)) {
+            $intersection += [math]::Min($sFreq[$gram], $tFreq[$gram])
+        }
+    }
+
+    $similarity = 2 * $intersection / ($sNGrams.Count + $tNGrams.Count)
+
+    return $similarity
+}
+
+function Get-MostSimilarFileName {
+    param (
+        [PSCustomObject[]] $FileIndex,
+        [string] $targetString,
+        [int] $n,
+				[float] $threshold = 0.1  # Default similarity threshold
+    )
+
+    $maxSimilarity = -1
+    $mostSimilarFile = $null
+
+    $FileIndex | ForEach-Object {
+        $file = $_
+        $similarity = Get-CosineSimilarity -s $file.FileName -t $targetString -n $n
+
+        if ($similarity -gt $maxSimilarity -and $similarity -ge $threshold) {
+            $maxSimilarity = $similarity
+            $mostSimilarFile = $file.FileName
+        }
+    }
+
+    return $mostSimilarFile
+}
+
+function Convert-HTMLContent {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$false)]
+        [string]$TitleContent = '',
+
+        [Parameter(Mandatory=$false)]
+        [string]$ProcessContent = '',
+				
+				[switch]$noTitle
+    )
+
+    begin {
+    }
+
+    process {
+        # Process image syntax
+        $imageSyntaxRegex = '!\[\[(.+?)\]\]'
+        $replacementTemplate = '<img src="http://CSCImages/{0}">'
+				
+				if($TitleContent.count -gt 0) {
+					[regex]::Matches($TitleContent, $imageSyntaxRegex) | ForEach-Object {
+							$match = $_.Groups[1].Value
+							$indexImage = $global:CheatSheet.FileIndex | Where-Object { $_.FileName -eq $match.split('.')[0] }
+							if ($null -ne $indexImage) {
+									$replacement = $replacementTemplate -f $indexImage.RelativePath.Replace('\', '/')
+									$TitleContent = $TitleContent -replace [regex]::Escape($_.Value), $replacement
+							}
+					}
+				}
+				
+        if($ProcessContent.count -gt 0) {
+            [regex]::Matches($ProcessContent, $imageSyntaxRegex) | ForEach-Object {
+                $match = $_.Groups[1].Value
+                $indexImage = $global:CheatSheet.FileIndex | Where-Object { $_.FileName -eq $match.split('.')[0] }
+                if ($null -ne $indexImage) {
+                    $replacement = $replacementTemplate -f $indexImage.RelativePath.Replace('\', '/')
+                    $ProcessContent = $ProcessContent -replace [regex]::Escape($_.Value), $replacement
+                }
+            }
+        }
+
+        # Process note links
+        $noteLinkRegex = '\[\[([^#\[\]|]+)(?:#([^|\[\]]+))?(?:\|[^|\[\]]+)?\]\]'
+				
+        if($TitleContent.count -gt 0) {
+					[regex]::Matches($TitleContent, $noteLinkRegex) | ForEach-Object {
+							$match = $_
+							$linkTarget = [System.Net.WebUtility]::HtmlEncode($match.Groups[1].Value)
+							$linkHash = if ($match.Groups[2].Value) { "%23" + [System.Net.WebUtility]::HtmlEncode($match.Groups[2].Value) } else { "" }
+							$replacement = '<a href="' + ($global:CheatSheet.General.INIConfig.Configuration.SourceLink -f $linkTarget) + $linkHash + '">' + $match.Groups[1].Value + $(if($match.groups[2].Value.Length -gt 0){' > ' + $match.groups[2].Value}) + '</a>'
+							$TitleContent = $TitleContent -replace [regex]::Escape($match.Value), $replacement
+					}
+				}
+				
+        if($ProcessContent.count -gt 0) {
+            [regex]::Matches($ProcessContent, $noteLinkRegex) | ForEach-Object {
+                $match = $_
+                $linkTarget = [System.Net.WebUtility]::HtmlEncode($match.Groups[1].Value)
+                $linkHash = if ($match.Groups[2].Value) { "%23" + [System.Net.WebUtility]::HtmlEncode($match.Groups[2].Value) } else { "" }
+                $replacement = '<a href="' + ($global:CheatSheet.General.INIConfig.Configuration.SourceLink -f $linkTarget) + $linkHash + '">' + $match.Groups[1].Value + $(if($match.groups[2].Value.Length -gt 0){' > ' + $match.groups[2].Value}) + '</a>'
+                $ProcessContent = $ProcessContent -replace [regex]::Escape($match.Value), $replacement
+            }
+        }
+
+        # Generate HTML content
+        $htmlContent = @'
+
+<html>
+    <link rel="stylesheet" href="./styles/default.min.css">
+    <script src="highlight.min.js"></script>
+    <script>hljs.highlightAll();</script>
+'@ + $(if (Test-Path "$($global:CheatSheet.General.CurrentPath)\styles\userstyle.css") { 
+        '<style>' + (Get-Content -Path "$($global:CheatSheet.General.CurrentPath)\styles\userstyle.css" -Raw) + '</style>'
+    }) +
+@'    
+    <body class="markdown-body">
+'@ + $( if($TitleContent.Length -gt 0) {
+@'		
+        <div class="file-section">
+'@ + $(if (-not ($noTitle)) {
+        '<div class="file-header">found for title: ' +
+				 $global:CheatSheet.LastActiveProcess.Files.Title +
+				 '</div>
+         <div class="splitter"></div>'
+    }) +
+@'
+            <div class="file-content">
+'@ + $TitleContent +
+@'                    
+            </div>
+        </div>
+'@  } ) +
+@'				
+'@ + $( if($ProcessContent.Length -gt 0) {
+@'
+        <div class="file-section">
+            <div class="file-header">found for process: 
+'@  + $global:CheatSheet.LastActiveProcess.Files.Process +
+@'
+            </div>
+            <div class="splitter"></div>
+            <div class="file-content">
+'@  + $ProcessContent + 
+@'
+            </div>
+        </div>
+'@  } ) +
+@'
+   </body>
+</html>
+'@
+
+        # Output the HTML content
+        return $htmlContent
+    }
+}
+
 
 Add-Type -AssemblyName `
     PresentationCore,`
@@ -206,7 +489,8 @@ Add-Type -TypeDefinition @'
     }
 '@ -ReferencedAssemblies System.Windows.Forms
 
-$global:CheatSheat = [pscustomobject]@{
+
+$global:CheatSheet = [pscustomobject]@{
     'General' = [pscustomobject]@{
         'WindowHeight' = 0
         'WindowType' = $null
@@ -230,120 +514,78 @@ $global:CheatSheat = [pscustomobject]@{
             'Handle' = $null
         }
     }
+    'FileIndex' = $null
     'LastActiveProcess' = [pscustomobject]@{
         'Title' = $null
         'Process' = $null
+        'Files' = [pscustomobject]@{
+						'Title' = $null
+						'Process' = $null
+				}
     }
     'AutoSwitch' = [pscustomobject]@{
-        'Active' = $false
+        'Active' = $true
         'SynchronizeWindow' = [hashtable]::Synchronized(@{})
         'LastProcess' = [pscustomobject]@{
-            'Title' = $null
-            'Process' = $null
+            'Title' = ''
+            'Process' = ''
         }
     }
 }
 
-
-if(-not $(Test-Path -Path $($global:CheatSheat.General.CurrentPath + '\Output'))) {
-    New-Item -Name 'Output' -ItemType Directory -Path $global:CheatSheat.General.CurrentPath -Force
+if (($null -eq $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder) -or ($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder.Length -lt 1)){
+    $global:CheatSheet.General.INIConfig += [PSCustomObject]@{
+        'Configuration' = @([PSCustomObject]@{
+            'MarkDownFolder' = $($global:CheatSheet.General.CurrentPath + '\md')
+            'SourceLink' = ''
+        })
+    }
+    $global:CheatSheet.General.INIConfig += [PSCustomObject]@{
+        'RegEx' = @([PSCustomObject]@{
+            'Prozess' = ''
+            'NoteLink' = ''
+        })
+    }
 }
 
-if(-not $(Test-Path -Path $($global:CheatSheat.General.CurrentPath + '\md'))) {
-    New-Item -Name 'md' -ItemType Directory -Path $global:CheatSheat.General.CurrentPath -Force
+<#
+    Cleanup old converted markdown files
+#>
+if(-not $(Test-Path -Path $($global:CheatSheet.General.CurrentPath + '\Output'))) {
+    New-Item -Name 'Output' -ItemType Directory -Path $global:CheatSheet.General.CurrentPath -Force
+}
+else {
+    Get-ChildItem -Path $($global:CheatSheet.General.CurrentPath + '\Output\') | Remove-Item -Force -Recurse
 }
 
-Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\md') -Filter '*.md' -Recurse | ForEach-Object {
-    $(ConvertFrom-Markdown -Path $_.FullName).Html | Out-File $($global:CheatSheat.General.CurrentPath + '\Output\' + $_.BaseName + '.html') -Force
+<#
+    Convert markdown files to HTML and create the file index
+#>
+
+Get-ChildItem -Path $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder -Filter '*.md' -Recurse | ForEach-Object {
+    Convert-MarkdownToHtml -MarkdownFile $_.FullName -OutputPath $($global:CheatSheet.General.CurrentPath + '\Output')
 }
+
+$global:CheatSheet.FileIndex = Get-FileHash -FolderPath $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder
+
+<#
+    Check the existing browser engines
+#>
 
 if(Test-Path $($env:ProgramFiles + '\PackageManagement\NuGet\Packages\Microsoft.Web.WebView*')) {
 	[CheatSheetCompanionHelper.WindowHelper]::SetDllDirectory($($(Split-Path $(Get-Item $($env:ProgramFiles + '\PackageManagement\NuGet\Packages\Microsoft.Web.WebView*\runtimes\win-x64\native\WebView2Loader.dll')).FullName -Parent)))
 	Add-Type -Path $(Get-Item $($env:ProgramFiles + '\PackageManagement\NuGet\Packages\Microsoft.Web.WebView*\lib\netcoreapp3.0\Microsoft.Web.WebView2.Wpf.dll')).FullName
 	Add-Type -Path $(Get-Item $($env:ProgramFiles + '\PackageManagement\NuGet\Packages\Microsoft.Web.WebView*\lib\netcoreapp3.0\Microsoft.Web.WebView2.Core.dll')).FullName
 
-    $global:CheatSheat.General.WindowType = 'WebView2'
+    $global:CheatSheet.General.WindowType = 'WebView2'
 }
 else {
-    $global:CheatSheat.General.WindowType = 'WebBrowser'
+    $global:CheatSheet.General.WindowType = 'WebBrowser'
 }
 
-
-$initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-
-$initialSessionState.Variables.Add(
-		(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheat",$CheatSheat,$Null))
-
-$initialSessionState.Variables.Add(
-        (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "Window",$null,$Null))
-
-$global:CheatSheat.Threads.ActiveWindow.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $initialSessionState)
-$($global:CheatSheat.Threads.ActiveWindow.Runspace).ApartmentState = "STA"
-$($global:CheatSheat.Threads.ActiveWindow.Runspace).ThreadOptions = "ReuseThread"
-$($global:CheatSheat.Threads.ActiveWindow.Runspace).Open()
-
-
-$Code = {
-    while($true){
-        $hWnd = [CheatSheetCompanionHelper.WindowHelper]::GetForegroundWindow()
-        $len = [CheatSheetCompanionHelper.WindowHelper]::GetWindowTextLength($hWnd)
-        $sb = New-Object text.stringbuilder -ArgumentList ($len + 1)
-        $rtnlen = [CheatSheetCompanionHelper.WindowHelper]::GetWindowText($hWnd,$sb,$sb.Capacity)
-        
-        $global:CheatSheat.LastActiveProcess.Title = $sb.tostring()
-        $processId = [uint]0 
-        [CheatSheetCompanionHelper.WindowHelper]::GetWindowThreadProcessId($hWnd,[ref]$processId)
-        $global:CheatSheat.LastActiveProcess.Process = $null
-        $global:CheatSheat.LastActiveProcess.Process = [System.Diagnostics.Process]::GetProcessById($processId)
-		
-        if((($global:CheatSheat.AutoSwitch.Active -eq $true) -and ($global:CheatSheat.LastActiveProcess.Title -ne $global:CheatSheat.AutoSwitch.LastProcess.Title)) -and ($global:CheatSheat.LastActiveProcess.Title -ne 'CheatSheetCompanion')) {
-            $file = ''
-
-            Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\Output') | Sort-Object LastWriteTime -Descending | ForEach-Object {
-                $item = $_  
-                
-                if($($($item.BaseName -split '_') -split '-' | Where-Object { $global:CheatSheat.LastActiveProcess.Title -like $('*' + $($_.Trim() + '*') ) }).Length -gt 0) {
-                    $file += Get-Content -Path $item.FullName -Raw
-                }
-                elseif($($($item.BaseName -split '_') -split '-' | Where-Object { $global:CheatSheat.LastActiveProcess.Process.Name -like $('*' + $($_.Trim() + '*') ) }).Length -gt 0) {
-                    $file += Get-Content -Path $item.FullName -Raw
-                }
-            }
-
-            if($file.length -gt 0) {
-                $global:CheatSheat.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
-                    $Window.FindName('WebBrowser').NavigateToString($(
-                        '<link rel="stylesheet" href="./styles/default.min.css">' + `
-                        '<script src="highlight.min.js"></script>' + `
-                        '<script>hljs.highlightAll();</script>' + `
-                        $(if(Test-Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css')){ 
-                            '<style>' + $(Get-Content -Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css') -Raw) + '</style>'
-                        })  + `
-                        '<body class="markdown-body">' + $file + '</body></html>'
-                    ))
-                })
-            }
-            Remove-Variable -Name 'file' -Force
-
-            $global:CheatSheat.AutoSwitch.LastProcess.Title = $sb.tostring()
-            $global:CheatSheat.AutoSwitch.LastProcess.Process = $null
-            $global:CheatSheat.AutoSwitch.LastProcess.Process = [System.Diagnostics.Process]::GetProcessById($processId)
-
-                
-            $global:CheatSheat.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
-                $Window.FindName('txtStatus').Text = $('Process: ' + $global:CheatSheat.LastActiveProcess.Process.Name +  ' - Title: ' + $global:CheatSheat.LastActiveProcess.Title)
-            })                
-        }
-        
-        Start-Sleep -Seconds 1
-    }
-}
-
-$global:CheatSheat.Threads.ActiveWindow.PowerShell = [PowerShell]::Create()
-$($global:CheatSheat.Threads.ActiveWindow.PowerShell).AddScript($Code) | Out-Null
-
-$($global:CheatSheat.Threads.ActiveWindow.PowerShell).Runspace = $global:CheatSheat.Threads.ActiveWindow.Runspace
-$global:CheatSheat.Threads.ActiveWindow.Handle = $($global:CheatSheat.Threads.ActiveWindow.PowerShell).BeginInvoke()
+<#
+    Draw the WPF GUI
+#>
 
 $Window_XAML = @'
 <Window 
@@ -353,12 +595,12 @@ $Window_XAML = @'
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
 '@
 
-if($global:CheatSheat.General.WindowType -eq 'WebView2') {
+if($global:CheatSheet.General.WindowType -eq 'WebView2') {
     $Window_XAML += '    xmlns:Wpf="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"'
 }
 
 $Window_XAML += @'
-    Width="400" Height="300" WindowStyle="ToolWindow" Opacity="0.85">
+    Width="600" Height="450" WindowStyle="ToolWindow" Opacity="0.85">
     <Grid Name="MainGrid" Margin="5">
         <Border Name="MinimizeBorder" BorderThickness="1" BorderBrush="Gray" Margin="-10,-10,-20,-10" VerticalAlignment="Top">
             <Button Name="MinimizeButton">
@@ -375,22 +617,17 @@ $Window_XAML += @'
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0" Grid.Row="0" Orientation="Horizontal" Margin="5,15,5,0">
-                <ComboBox Name="MarkdownComboBox" IsEditable="False" VerticalAlignment="Top" HorizontalAlignment="Left" Width="138" ToolTip="Select a note to view.">
+                <ComboBox Name="MarkdownComboBox" IsEditable="True" VerticalAlignment="Top" HorizontalAlignment="Left" Width="138" ToolTip="Search and select a note to view.">
 '@
 
-Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\md') -Filter '*.md' -Recurse | ForEach-Object {
-    $Window_XAML += '                <ComboBoxItem>' + $($($_.BaseName  -replace '_','/') -replace '-','//') + '</ComboBoxItem>'
+$global:CheatSheet.FileIndex | Where-Object {$_.RelativePath -match '.md'} | ForEach-Object {
+    $Window_XAML += '                <ComboBoxItem>' + $_.FileName + '</ComboBoxItem>'
 }
 
 $Window_XAML += @'            
                 </ComboBox>
             </StackPanel>    
             <StackPanel Grid.Column="1" Grid.Row="0" Orientation="Horizontal" Margin="5,15,5,0">
-                <Button Background="LightGray" Name="RefreshButton" BorderBrush="Gray" BorderThickness="1" Height="22" Width="25" HorizontalAlignment="Right"  Margin="0,0,5,0" VerticalAlignment="Top" ToolTip="Refresh all notes.">
-                    <StackPanel Orientation="Horizontal">
-                        <TextBlock FontFamily="Segoe UI Symbol" Text="&#xE117;" Name="txtRefreshMarkdown" HorizontalAlignment="Right"/>
-                    </StackPanel>
-                </Button>
                 <Button Background="LightGray" Name="btnEditMarkdown" BorderBrush="Gray" BorderThickness="1" Height="22" Width="25" HorizontalAlignment="Right"  Margin="0,0,5,0" VerticalAlignment="Top" ToolTip="Edit the selected note.">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock FontFamily="Segoe UI Symbol" Text="&#xE104;" Name="txtEditMarkdown" HorizontalAlignment="Right"/>
@@ -408,12 +645,12 @@ $Window_XAML += @'
                         </TextBlock>  
                     </TextBlock.ToolTip> 					
                     <StackPanel Orientation="Horizontal">
-                        <TextBlock FontFamily="Segoe UI Symbol" Text="&#xE149;" Name="txtLastActiveWindow" HorizontalAlignment="Right"/>
+                        <TextBlock FontFamily="Segoe UI Symbol" Text="&#xE149;" Name="txtLastActiveWindow" Foreground="#FFED1C24" HorizontalAlignment="Right"/>
                     </StackPanel>
                 </Button>
             </StackPanel>    
 '@            
-if($global:CheatSheat.General.WindowType -eq 'WebView2') {
+if($global:CheatSheet.General.WindowType -eq 'WebView2') {
     $Window_XAML += "`n" + '            <Wpf:WebView2 Name="WebBrowser" Source="about:blank" Margin="5,5,5,25" Grid.Row="1" Grid.ColumnSpan="2" />' + "`n"
 } else {
     $Window_XAML += "`n" + '            <WebBrowser Name="WebBrowser" Margin="5,5,5,25" HorizontalAlignment="Left" VerticalAlignment="Bottom" Grid.Row="1" Grid.ColumnSpan="2" />' + "`n"
@@ -431,18 +668,187 @@ $Window_XAML += @'
 </Window>
 '@
 
+
 $strWrite = New-Object IO.StringWriter
 $([xml]$Window_XAML).save($strWrite)
 
-$global:CheatSheat.AutoSwitch.SynchronizeWindow = [Windows.Markup.XamlReader]::Parse("$strWrite")
-$window = $global:CheatSheat.AutoSwitch.SynchronizeWindow
+$global:CheatSheet.AutoSwitch.SynchronizeWindow = [Windows.Markup.XamlReader]::Parse("$strWrite")
+$window = $global:CheatSheet.AutoSwitch.SynchronizeWindow
 
 Remove-Variable -Name Window_XAML -Force
+
+<#
+    Create the active file sync thread
+#>
+
+$initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+
+$initialSessionState.Variables.Add(
+        (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheet",$CheatSheet,$Null))
+
+$definition = Get-Content Function:Get-FileHash -ErrorAction Stop
+$addMessageSessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList 'Get-FileHash', $definition
+$initialSessionState.Commands.Add($addMessageSessionStateFunction)
+
+$definition = Get-Content Function:Convert-MarkdownToHtml -ErrorAction Stop
+$addMessageSessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList 'Convert-MarkdownToHtml', $definition
+$initialSessionState.Commands.Add($addMessageSessionStateFunction)
+
+$global:CheatSheet.Threads.MarkDownConvert.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $initialSessionState)
+$($global:CheatSheet.Threads.MarkDownConvert.Runspace).ApartmentState = "STA"
+$($global:CheatSheet.Threads.MarkDownConvert.Runspace).ThreadOptions = "ReuseThread"
+$($global:CheatSheet.Threads.MarkDownConvert.Runspace).Open()
+
+
+$Code = {
+    Start-Sleep -Seconds 30
+
+    while($true){
+        $MarkDownChanges = Get-FileHash -FolderPath $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder | 
+            Where-Object {$global:CheatSheet.FileIndex.Hash -notcontains $_.Hash}
+
+        $NewMarkDownFiles = Get-FileHash -FolderPath $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder | 
+            Where-Object {$global:CheatSheet.FileIndex.RelativePath -notcontains $_.RelativePath}
+
+        $MissingMarkDownFiles = $global:CheatSheet.FileIndex | 
+            Where-Object {-not (Test-Path -Path ($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder + '\' + $_.RelativePath))}
+
+        if (($MarkDownChanges.count -gt 0) -or ($NewMarkDownFiles.count -gt 0) -or ($MissingMarkDownFiles.count -gt 0)) {
+            $MarkDownChanges | ForEach-Object {
+                $MarkDownChange = $_
+                if($MarkDownChange.RelativePath -match '.md') {
+                    Convert-MarkdownToHtml -MarkdownFile $($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder + '\' + $MarkDownChange.RelativePath) -OutputPath $($global:CheatSheet.General.CurrentPath + '\Output')
+                }
+                $($global:CheatSheet.FileIndex | Where-Object {$_.RelativePath -eq $MarkDownChange.RelativePath}).Hash = $MarkDownChange.Hash
+            }
+
+            $NewMarkDownFiles | ForEach-Object {
+                $NewMarkDownFile = $_
+                if($NewMarkDownFile.RelativePath -match '.md') {
+                    Convert-MarkdownToHtml -MarkdownFile $($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder + '\' + $NewMarkDownFile.RelativePath) -OutputPath $($global:CheatSheet.General.CurrentPath + '\Output')
+                }
+                $global:CheatSheet.FileIndex += $NewMarkDownFile
+            }
+
+            $MissingMarkDownFiles | ForEach-Object {
+                $MissingMarkDownFile = $_
+                $global:CheatSheet.FileIndex = $global:CheatSheet.FileIndex | Where-Object {$_.RelativePath -ne $MissingMarkDownFile.RelativePath}
+            }
+        }
+
+        Start-Sleep -Seconds 5
+    }
+}
+
+$global:CheatSheet.Threads.MarkDownConvert.PowerShell = [PowerShell]::Create()
+$($global:CheatSheet.Threads.MarkDownConvert.PowerShell).AddScript($Code) | Out-Null
+
+$($global:CheatSheet.Threads.MarkDownConvert.PowerShell).Runspace = $global:CheatSheet.Threads.MarkDownConvert.Runspace
+$global:CheatSheet.Threads.MarkDownConvert.Handle = $($global:CheatSheet.Threads.MarkDownConvert.PowerShell).BeginInvoke()
+
+<#
+    Create the active windows check thread
+#>
+
+$initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+
+$initialSessionState.Variables.Add(
+	(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheet",$global:CheatSheet,$Null))
+
+$initialSessionState.Variables.Add(
+  (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "Window",$Window,$Null))
+
+$initialSessionState.Variables.Add(
+	(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "ShowResult",$($global:CheatSheet.AutoSwitch.SynchronizeWindow.FindName("ShowResult")),$Null))
+
+$definition = Get-Content Function:Get-MostSimilarFileName -ErrorAction Stop
+$addMessageSessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList 'Get-MostSimilarFileName', $definition
+$initialSessionState.Commands.Add($addMessageSessionStateFunction)   
+
+$definition = Get-Content Function:Get-CosineSimilarity -ErrorAction Stop
+$addMessageSessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList 'Get-CosineSimilarity', $definition
+$initialSessionState.Commands.Add($addMessageSessionStateFunction)    
+
+$definition = Get-Content Function:Get-NGrams -ErrorAction Stop
+$addMessageSessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList 'Get-NGrams', $definition
+$initialSessionState.Commands.Add($addMessageSessionStateFunction)        
+
+$definition = Get-Content Function:Convert-HTMLContent -ErrorAction Stop
+$addMessageSessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList 'Convert-HTMLContent', $definition
+$initialSessionState.Commands.Add($addMessageSessionStateFunction)        
+
+$global:CheatSheet.Threads.ActiveWindow.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $initialSessionState)
+$($global:CheatSheet.Threads.ActiveWindow.Runspace).ApartmentState = "STA"
+$($global:CheatSheet.Threads.ActiveWindow.Runspace).ThreadOptions = "ReuseThread"
+$($global:CheatSheet.Threads.ActiveWindow.Runspace).Open()
+
+
+$Code = {
+    Start-Sleep -Seconds 5
+
+    while($true){
+        $hWnd = [CheatSheetCompanionHelper.WindowHelper]::GetForegroundWindow()
+        $len = [CheatSheetCompanionHelper.WindowHelper]::GetWindowTextLength($hWnd)
+        $sb = New-Object text.stringbuilder -ArgumentList ($len + 1)
+        $rtnlen = [CheatSheetCompanionHelper.WindowHelper]::GetWindowText($hWnd,$sb,$sb.Capacity)
+        
+        $global:CheatSheet.LastActiveProcess.Title = $sb.tostring()
+        $processId = [uint]0 
+        [CheatSheetCompanionHelper.WindowHelper]::GetWindowThreadProcessId($hWnd,[ref]$processId)
+        $global:CheatSheet.LastActiveProcess.Process = $null
+        $global:CheatSheet.LastActiveProcess.Process = [System.Diagnostics.Process]::GetProcessById($processId)
+		
+        if((($global:CheatSheet.AutoSwitch.Active -eq $true) -and ($global:CheatSheet.LastActiveProcess.Title -ne $global:CheatSheet.AutoSwitch.LastProcess.Title)) -and ($global:CheatSheet.LastActiveProcess.Title -ne 'CheatSheetCompanion')) {
+						$HTMLContent = ''
+						$n = 3
+            $global:CheatSheet.LastActiveProcess.Files.Title = Get-MostSimilarFileName -FileIndex $global:CheatSheet.FileIndex -targetString $global:CheatSheet.LastActiveProcess.Title -n $n
+            $global:CheatSheet.LastActiveProcess.Files.Process = Get-MostSimilarFileName -FileIndex $global:CheatSheet.FileIndex -targetString $global:CheatSheet.LastActiveProcess.Process -n $n
+						
+						if(($global:CheatSheet.LastActiveProcess.Files.Title.Length -gt 0) -or ($global:CheatSheet.LastActiveProcess.Files.Process.Length -gt 0)) {
+							if($global:CheatSheet.LastActiveProcess.Files.Title -ne $global:CheatSheet.LastActiveProcess.Files.Process) {
+								$TitleContent = Get-Content -Path $($global:CheatSheet.General.CurrentPath + '\Output\' + $global:CheatSheet.LastActiveProcess.Files.Title + '.html') -Raw
+								$ProcessContent = Get-Content -Path $($global:CheatSheet.General.CurrentPath + '\Output\' + $global:CheatSheet.LastActiveProcess.Files.Process + '.html') -Raw
+								
+								$HTMLContent = Convert-HTMLContent -TitleContent $TitleContent -ProcessContent $ProcessContent
+							}
+							else {
+								$TitleContent = Get-Content -Path $($global:CheatSheet.General.CurrentPath + '\Output\' + $global:CheatSheet.LastActiveProcess.Files.Title + '.html') -Raw
+								$HTMLContent = Convert-HTMLContent -TitleContent $TitleContent
+							}
+						}
+						
+						if($HTMLContent.Length -gt 0) {
+							$global:CheatSheet.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
+								
+									$window.FindName("WebBrowser").CoreWebView2.SetVirtualHostNameToFolderMapping("CSCImages", $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder, [Microsoft.Web.WebView2.Core.CoreWebView2HostResourceAccessKind]::Allow)
+									$Window.FindName('WebBrowser').NavigateToString($HTMLContent)
+							})
+						}
+						
+            $global:CheatSheet.AutoSwitch.LastProcess.Title = $sb.tostring()
+            $global:CheatSheet.AutoSwitch.LastProcess.Process = $null
+            $global:CheatSheet.AutoSwitch.LastProcess.Process = [System.Diagnostics.Process]::GetProcessById($processId)
+                
+            $global:CheatSheet.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
+                $Window.FindName('txtStatus').Text = $('Process: ' + $global:CheatSheet.LastActiveProcess.Process.Name +  ' - Title: ' + $global:CheatSheet.LastActiveProcess.Title)
+            })                
+        }
+        
+        Start-Sleep -Seconds 1
+    }
+}
+
+$global:CheatSheet.Threads.ActiveWindow.PowerShell = [PowerShell]::Create()
+$($global:CheatSheet.Threads.ActiveWindow.PowerShell).AddScript($Code) | Out-Null
+
+$($global:CheatSheet.Threads.ActiveWindow.PowerShell).Runspace = $global:CheatSheet.Threads.ActiveWindow.Runspace
+$global:CheatSheet.Threads.ActiveWindow.Handle = $($global:CheatSheet.Threads.ActiveWindow.PowerShell).BeginInvoke()
+
 
 $Window.FindName('MinimizeButton').`
     add_Click({
         if($Window.Height -lt 15) {
-            $Window.Height = $global:CheatSheat.General.WindowHeight
+            $Window.Height = $global:CheatSheet.General.WindowHeight
 
             $Window.FindName('InnerGrid').Visibility = 'Visible'
             $Window.FindName('StatusBar').Visibility = 'Visible'
@@ -452,7 +858,7 @@ $Window.FindName('MinimizeButton').`
             $Window.FindName('MinimizeText').Text = [System.Net.WebUtility]::HtmlDecode('&#x1f53a;&#x1f53a;&#x1f53a;') 
         }
         else {
-            $global:CheatSheat.General.WindowHeight = $Window.Height
+            $global:CheatSheet.General.WindowHeight = $Window.Height
 
             $Window.FindName('InnerGrid').Visibility = 'Hidden'
             $Window.FindName('StatusBar').Visibility = 'Hidden'
@@ -475,160 +881,112 @@ $Window.FindName('MarkdownComboBox').`
         $selectedItem = $null
         $selectedItem = $Window.FindName('MarkdownComboBox').items | Where-Object {$_.IsSelected -eq $true}
 
-        if($null -ne $selectedItem) {
-            $file = Get-Content -Path $($global:CheatSheat.General.CurrentPath + '\Output\' + $($($selectedItem.content  -replace '/','_') -replace '//','-') + '.html') -Raw
-
-            if($null -ne $file) {
-                $Window.FindName('WebBrowser').NavigateToString($(
-                    '<html><head><meta charset="UTF-8"></head>' + `
-                    '<link rel="stylesheet" href="./styles/default.min.css">' + `
-                    '<script src="highlight.min.js"></script>' + `
-                    '<script>hljs.highlightAll();</script>' + `
-                    $(if(Test-Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css')){
-                         '<style>' + $(Get-Content -Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css') -Raw) + '</style>'
-                    })  + `
-                    '<body class="markdown-body">' + $file + '</body></html>'
-                ))
-            }
+        if($null -ne $selectedItem) {         
+            
+            $TitleContent = Get-Content -Path $($global:CheatSheet.General.CurrentPath + '\Output\' + $selectedItem.content + '.html') -Raw
+						
+						$global:CheatSheet.LastActiveProcess.Files.Title = $selectedItem.content
+            $global:CheatSheet.LastActiveProcess.Files.Process = ''
+						
+						<#
+							add a always content switch
+						#>
+						
+						$global:CheatSheet.AutoSwitch.LastProcess.Title = $null
+						$global:CheatSheet.AutoSwitch.LastProcess.Process = $null
+						
+            $window.FindName("WebBrowser").CoreWebView2.SetVirtualHostNameToFolderMapping("CSCImages", $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder, [Microsoft.Web.WebView2.Core.CoreWebView2HostResourceAccessKind]::Allow)
+            $Window.FindName('WebBrowser').NavigateToString($(Convert-HTMLContent -TitleContent $TitleContent -noTitle))
         }
-    })    
+    }) 
 
-$Window.FindName('txtRefreshMarkdown').`
-    Add_MouseDown({
+$Window.FindName('MarkdownComboBox').`
+    Add_SelectionChanged({
+				$selectedItem = $null
+				$selectedItem = $Window.FindName('MarkdownComboBox').items | Where-Object {$_.IsSelected -eq $true}
 
-        Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\Output') | Remove-Item -Force
-
-        $MarkdownComboBox = $Window.FindName('MarkdownComboBox')
-        $MarkdownComboBox.items.Clear()
-
-        Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\md') -Filter '*.md' -Recurse | ForEach-Object {
-            $ComboBoxItem1 = New-Object System.Windows.Controls.ComboBoxItem
-            $ComboBoxItem1.Content = $($($_.BaseName -replace '_','/') -replace '-','//')
-            $MarkdownComboBox.Items.Add($ComboBoxItem1)
-        }
-
-        $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-
-        $initialSessionState.Variables.Add(
-                (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheat",$CheatSheat,$Null))
-
-        $global:CheatSheat.Threads.MarkDownConvert.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $initialSessionState)
-        $($global:CheatSheat.Threads.MarkDownConvert.Runspace).ApartmentState = "STA"
-        $($global:CheatSheat.Threads.MarkDownConvert.Runspace).ThreadOptions = "ReuseThread"
-        $($global:CheatSheat.Threads.MarkDownConvert.Runspace).Open()
-
-
-        $Code = {
-            Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\md') -Filter '*.md' -Recurse | ForEach-Object {
-                $(ConvertFrom-Markdown -Path $_.FullName).Html | Out-File $($global:CheatSheat.General.CurrentPath + '\Output\' + $_.BaseName + '.html') -Force
-            }
-        }
-
-        $global:CheatSheat.Threads.MarkDownConvert.PowerShell = [PowerShell]::Create()
-        $($global:CheatSheat.Threads.MarkDownConvert.PowerShell).AddScript($Code) | Out-Null
-        
-        $($global:CheatSheat.Threads.MarkDownConvert.PowerShell).Runspace = $global:CheatSheat.Threads.MarkDownConvert.Runspace
-        $global:CheatSheat.Threads.MarkDownConvert.Handle = $($global:CheatSheat.Threads.MarkDownConvert.PowerShell).BeginInvoke()
-
-        $($global:CheatSheat.Threads.MarkDownConvert.PowerShell).EndInvoke($global:CheatSheat.Threads.MarkDownConvert.Handle[0])
-    })
-
+				if($null -ne $selectedItem) {         
+						
+						$TitleContent = Get-Content -Path $($global:CheatSheet.General.CurrentPath + '\Output\' + $selectedItem.content + '.html') -Raw
+												
+												$global:CheatSheet.LastActiveProcess.Files.Title = $selectedItem.content
+						$global:CheatSheet.LastActiveProcess.Files.Process = ''
+												
+												<#
+														add a always content switch
+												#>
+												
+												$global:CheatSheet.AutoSwitch.LastProcess.Title = $null
+												$global:CheatSheet.AutoSwitch.LastProcess.Process = $null
+												
+						$window.FindName("WebBrowser").CoreWebView2.SetVirtualHostNameToFolderMapping("CSCImages", $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder, [Microsoft.Web.WebView2.Core.CoreWebView2HostResourceAccessKind]::Allow)
+						$Window.FindName('WebBrowser').NavigateToString($(Convert-HTMLContent -TitleContent $TitleContent -noTitle))
+				}
+    }) 
+		
 $Window.FindName('txtEditMarkdown').`
-    Add_MouseDown({    
-        $selectedItem = $null
-        $selectedItem = $Window.FindName('MarkdownComboBox').items | Where-Object {$_.IsSelected -eq $true}
-        if($null -ne $selectedItem) {
-            $file = $null
-            $file = Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\md\') -Recurse -Filter $($($($selectedItem.content -replace '/','_') -replace '//','-') + '.md') | Select-Object -First 1
-            if($null -ne $file) {
-                Start-Process -FilePath $file.FullName               
+    Add_MouseDown({
+        if($global:CheatSheet.LastActiveProcess.Files.Title.Length -gt 0){
+
+            if($global:CheatSheet.General.INIConfig.Configuration.SourceLink -gt 0) {
+                Start-Process $($global:CheatSheet.General.INIConfig.Configuration.SourceLink -f $global:CheatSheet.LastActiveProcess.Files.Title) | Out-Null
+            }
+            else {
+                Start-Process -FilePath $($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder + '\' + $global:CheatSheet.LastActiveProcess.Files.Title)
             }
         }
-        else {
-            $Window.FindName('txtStatus').Text = 'Choose a markdown file first before trying to edit.'
-        }
-    })
+    })		
 
 $Window.FindName('txtAddMarkdown').`
     Add_MouseDown({    
+        if(-not(Test-Path $($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder + '\' + $global:CheatSheet.AutoSwitch.LastProcess.Title + '.md'))) {
+            New-Item -Path $global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder -Name $(Convert-ToWindowsFilename -filename $($global:CheatSheet.AutoSwitch.LastProcess.Title + '.md'))
 
-        if($global:CheatSheat.AutoSwitch.Active -eq $true) {
-            if(-not(Test-Path $($global:CheatSheat.General.CurrentPath + '\md\' + $global:CheatSheat.AutoSwitch.LastProcess.Process.Name + '.md'))) {
-                New-Item -Path $($global:CheatSheat.General.CurrentPath + '\md') -Name $($global:CheatSheat.AutoSwitch.LastProcess.Process.Name + '.md')
-
-                Start-Process -FilePath $($global:CheatSheat.General.CurrentPath + '\md\' + $global:CheatSheat.AutoSwitch.LastProcess.Process.Name + '.md')
-                $Window.FindName('txtStatus').Text = 'Created a ' + $global:CheatSheat.AutoSwitch.LastProcess.Process.Name + ' markdown file.'
+            if($global:CheatSheet.General.INIConfig.Configuration.SourceLink -gt 0) {
+                Start-Process $($global:CheatSheet.General.INIConfig.Configuration.SourceLink -f $(Convert-ToWindowsFilename -filename $($global:CheatSheet.AutoSwitch.LastProcess.Title))) | Out-Null
+            }
+            else {
+                Start-Process -FilePath $($global:CheatSheet.General.INIConfig.Configuration.MarkDownFolder + '\' + $(Convert-ToWindowsFilename -filename $($global:CheatSheet.AutoSwitch.LastProcess.Title + '.md')))
             }
         }
-        else {
-            Start-Process -FilePath $(New-Item -Path $($global:CheatSheat.General.CurrentPath + '\md') -Name $('PROCESS_OR_TITLE_' + $(Get-Random) + '.md') -ItemType File).FullName
-            $Window.FindName('txtStatus').Text = 'Created a random markdown file.'
-        }
-    })
-
+    })		
+		
 $Window.FindName('txtLastActiveWindow').`
     Add_MouseDown({
-        if([System.Windows.Forms.Control]::MouseButtons -eq [System.Windows.Forms.MouseButtons]::Left) {
-            if($global:CheatSheat.AutoSwitch.Active -eq $true) {
-                $Window.FindName('txtStatus').Text = 'Deactivate AutoSwitch first'
-            }
-            elseif($null -ne $global:CheatSheat.LastActiveProcess) {
-				
-				$file = $null
-				
-				if(Test-Path $($global:CheatSheat.General.CurrentPath + '\Output\' + $global:CheatSheat.LastActiveProcess.Process.Name + '.html')){
-					$file = Get-Content -Path $($global:CheatSheat.General.CurrentPath + '\Output\' + $global:CheatSheat.LastActiveProcess.Process.Name + '.html') -Raw
-                }
-
-                if($null -ne $file) {
-                    $Window.FindName('WebBrowser').NavigateToString($('<html><head><meta charset="UTF-8"></head>' + $(if(Test-Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css')){ '<style>' + $(Get-Content -Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css') -Raw) + '</style>'})  + '<body class="markdown-body">' + $file + '</body></html>'))
-                }
-                else {
-                    Get-ChildItem -Path $($global:CheatSheat.General.CurrentPath + '\md') | ForEach-Object {
-                        if($global:CheatSheat.LastActiveProcess.Title -like $('*' + $_.BaseName + '*')) {
-                            $file = Get-Content -Path $_.FullName -Raw
-                            
-                            $Window.FindName('WebBrowser').NavigateToString($('<html><head><meta charset="UTF-8"></head>' + $(if(Test-Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css')){ '<style>' + $(Get-Content -Path $($global:CheatSheat.General.CurrentPath + '\styles\userstyle.css') -Raw) + '</style>'})  + '<body class="markdown-body">' + $file + '</body></html>'))
-                        }
-                    }
-                }
-            }
-        }
-        elseif([System.Windows.Forms.Control]::MouseButtons -eq [System.Windows.Forms.MouseButtons]::Right) {
-            if($global:CheatSheat.AutoSwitch.Active -eq $true) {
-                $global:CheatSheat.AutoSwitch.Active = $false
+            if($global:CheatSheet.AutoSwitch.Active -eq $true) {
+                $global:CheatSheet.AutoSwitch.Active = $false
                 $Window.FindName('txtLastActiveWindow').Foreground = '#FF000000'
                 $Window.FindName('txtStatus').Text = 'Auto Sync deactivated.'                
             }
             else {
-                $global:CheatSheat.AutoSwitch.Active = $true
+                $global:CheatSheet.AutoSwitch.Active = $true
                 $Window.FindName('txtLastActiveWindow').Foreground = '#ED1C24'
+								$Window.FindName('txtStatus').Text = 'Auto Sync activated.'
             }
 
-            $global:CheatSheat.Threads.ActiveWindow.PowerShell.Stop()
-            $global:CheatSheat.Threads.ActiveWindow.PowerShell.Streams.ClearStreams()
+            $global:CheatSheet.Threads.ActiveWindow.PowerShell.Stop()
+            $global:CheatSheet.Threads.ActiveWindow.PowerShell.Streams.ClearStreams()
 					
-            $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("CheatSheat",$null)
+            $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("CheatSheet",$null)
 
-            $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("Window",$null)
+            $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("Window",$null)
             
-            $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
-                (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheat",$global:CheatSheat,$Null)
+            $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
+                (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheet",$global:CheatSheet,$Null)
             )
 
-            $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
-						(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "ShowResult",$($global:CheatSheat.AutoSwitch.SynchronizeWindow.FindName("ShowResult")),$Null))
+            $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
+						(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "ShowResult",$($global:CheatSheet.AutoSwitch.SynchronizeWindow.FindName("ShowResult")),$Null))
 
-            $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
+            $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
                 (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "Window",$Window,$Null)
             )
 
-            $global:CheatSheat.Threads.ActiveWindow.PowerShell.Runspace.ResetRunspaceState()
-            $global:CheatSheat.Threads.ActiveWindow.Handle = $($global:CheatSheat.Threads.ActiveWindow.PowerShell).BeginInvoke()						
-        }
+            $global:CheatSheet.Threads.ActiveWindow.PowerShell.Runspace.ResetRunspaceState()
+            $global:CheatSheet.Threads.ActiveWindow.Handle = $($global:CheatSheet.Threads.ActiveWindow.PowerShell).BeginInvoke()						
    })        
 
-if($global:CheatSheat.General.WindowType -ne 'WebView2') {   
+if($global:CheatSheet.General.WindowType -ne 'WebView2') {   
     $Window.FindName('WebBrowser').Add_Navigating({
         param($sender, $e)
 
@@ -655,22 +1013,22 @@ $window.add_Loaded({
     $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 
     $initialSessionState.Variables.Add(
-		(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheat",$global:CheatSheat,$Null))
+		(New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheet",$global:CheatSheet,$Null))
 
     $initialSessionState.Variables.Add(
         (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "Window",$Window,$Null))
 
-    $global:CheatSheat.Threads.GlobalShortcut.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $initialSessionState)
-    $($global:CheatSheat.Threads.GlobalShortcut.Runspace).ApartmentState = "STA"
-    $($global:CheatSheat.Threads.GlobalShortcut.Runspace).ThreadOptions = "ReuseThread"
-    $($global:CheatSheat.Threads.GlobalShortcut.Runspace).Open()
+    $global:CheatSheet.Threads.GlobalShortcut.Runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host, $initialSessionState)
+    $($global:CheatSheet.Threads.GlobalShortcut.Runspace).ApartmentState = "STA"
+    $($global:CheatSheet.Threads.GlobalShortcut.Runspace).ThreadOptions = "ReuseThread"
+    $($global:CheatSheet.Threads.GlobalShortcut.Runspace).Open()
 
     $Code = {
         while ($true) {
-            if($(Invoke-Command $([System.Management.Automation.ScriptBlock]::Create('[CheatSheetCompanionHelper.KeyLogger]::WaitForKey(' + $($($($global:CheatSheat.General.INIConfig.GlobalShortcut.DisplayCompanion -split ',') | ForEach-Object {[System.Management.Automation.ScriptBlock]::Create($('[System.Windows.Forms.Keys]::' + $_))}) -join ',') +')')) -NoNewScope)) {
-                $global:CheatSheat.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
+            if($(Invoke-Command $([System.Management.Automation.ScriptBlock]::Create('[CheatSheetCompanionHelper.KeyLogger]::WaitForKey(' + $($($($global:CheatSheet.General.INIConfig.GlobalShortcut.DisplayCompanion -split ',') | ForEach-Object {[System.Management.Automation.ScriptBlock]::Create($('[System.Windows.Forms.Keys]::' + $_))}) -join ',') +')')) -NoNewScope)) {
+                $global:CheatSheet.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
                     if($Window.Height -lt 15) {
-                        $Window.Height = $global:CheatSheat.General.WindowHeight
+                        $Window.Height = $global:CheatSheet.General.WindowHeight
                         
             
                         $Window.FindName('InnerGrid').Visibility = 'Visible'
@@ -681,7 +1039,7 @@ $window.add_Loaded({
                         $Window.FindName('MinimizeText').Text = [System.Net.WebUtility]::HtmlDecode('&#x1f53a;&#x1f53a;&#x1f53a;') 
                     }
                     else {
-                        $global:CheatSheat.General.WindowHeight = $Window.Height
+                        $global:CheatSheet.General.WindowHeight = $Window.Height
             
                         $Window.FindName('InnerGrid').Visibility = 'Hidden'
                         $Window.FindName('StatusBar').Visibility = 'Hidden'
@@ -692,51 +1050,51 @@ $window.add_Loaded({
                     }
                 })
             }
-            elseif($(Invoke-Command $([System.Management.Automation.ScriptBlock]::Create('[CheatSheetCompanionHelper.KeyLogger]::WaitForKey(' + $($($($global:CheatSheat.General.INIConfig.GlobalShortcut.AutoSwitch -split ',') | ForEach-Object {[System.Management.Automation.ScriptBlock]::Create($('[System.Windows.Forms.Keys]::' + $_))}) -join ',') +')')) -NoNewScope)) {
-                $global:CheatSheat.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
-                    if($global:CheatSheat.AutoSwitch.Active -eq $true) {
-                        $global:CheatSheat.AutoSwitch.Active = $false
+            elseif($(Invoke-Command $([System.Management.Automation.ScriptBlock]::Create('[CheatSheetCompanionHelper.KeyLogger]::WaitForKey(' + $($($($global:CheatSheet.General.INIConfig.GlobalShortcut.AutoSwitch -split ',') | ForEach-Object {[System.Management.Automation.ScriptBlock]::Create($('[System.Windows.Forms.Keys]::' + $_))}) -join ',') +')')) -NoNewScope)) {
+                $global:CheatSheet.AutoSwitch.SynchronizeWindow.Dispatcher.invoke(	[action]{
+                    if($global:CheatSheet.AutoSwitch.Active -eq $true) {
+                        $global:CheatSheet.AutoSwitch.Active = $false
                         $Window.FindName('txtLastActiveWindow').Foreground = '#FF000000'
                         
                         $Window.FindName('txtStatus').Text = 'Auto Sync deactivated.'
                         
                     }
                     else {
-                        $global:CheatSheat.AutoSwitch.Active = $true
+                        $global:CheatSheet.AutoSwitch.Active = $true
                         $Window.FindName('txtLastActiveWindow').Foreground = '#ED1C24'
                     }
 
-                    $global:CheatSheat.Threads.ActiveWindow.PowerShell.Stop()
-                    $global:CheatSheat.Threads.ActiveWindow.PowerShell.Streams.ClearStreams()
+                    $global:CheatSheet.Threads.ActiveWindow.PowerShell.Stop()
+                    $global:CheatSheet.Threads.ActiveWindow.PowerShell.Streams.ClearStreams()
                             
-                    $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("CheatSheat",$null)
+                    $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("CheatSheet",$null)
 
-                    $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("Window",$null)
+                    $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Remove("Window",$null)
                     
-                    $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
-                        (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheat",$global:CheatSheat,$Null)
+                    $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
+                        (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "CheatSheet",$global:CheatSheet,$Null)
                     )
 
-                    $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
-                                (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "ShowResult",$($global:CheatSheat.AutoSwitch.SynchronizeWindow.FindName("ShowResult")),$Null))
+                    $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
+                                (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "ShowResult",$($global:CheatSheet.AutoSwitch.SynchronizeWindow.FindName("ShowResult")),$Null))
 
-                    $global:CheatSheat.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
+                    $global:CheatSheet.Threads.ActiveWindow.Runspace.InitialSessionState.Variables.Add(
                         (New-object System.Management.Automation.Runspaces.SessionStateVariableEntry -ArgumentList "Window",$Window,$Null)
                     )
 
-                    $global:CheatSheat.Threads.ActiveWindow.PowerShell.Runspace.ResetRunspaceState()
-                    $global:CheatSheat.Threads.ActiveWindow.Handle = $($global:CheatSheat.Threads.ActiveWindow.PowerShell).BeginInvoke()
+                    $global:CheatSheet.Threads.ActiveWindow.PowerShell.Runspace.ResetRunspaceState()
+                    $global:CheatSheet.Threads.ActiveWindow.Handle = $($global:CheatSheet.Threads.ActiveWindow.PowerShell).BeginInvoke()
                 
                 })	
             }
         }
     }
 
-    $global:CheatSheat.Threads.GlobalShortcut.PowerShell = [PowerShell]::Create()
-    $($global:CheatSheat.Threads.GlobalShortcut.PowerShell).AddScript($Code) | Out-Null
+    $global:CheatSheet.Threads.GlobalShortcut.PowerShell = [PowerShell]::Create()
+    $($global:CheatSheet.Threads.GlobalShortcut.PowerShell).AddScript($Code) | Out-Null
 
-    $($global:CheatSheat.Threads.GlobalShortcut.PowerShell).Runspace = $global:CheatSheat.Threads.GlobalShortcut.Runspace
-    $global:CheatSheat.Threads.GlobalShortcut.Handle = $($global:CheatSheat.Threads.GlobalShortcut.PowerShell).BeginInvoke()
+    $($global:CheatSheet.Threads.GlobalShortcut.PowerShell).Runspace = $global:CheatSheet.Threads.GlobalShortcut.Runspace
+    $global:CheatSheet.Threads.GlobalShortcut.Handle = $($global:CheatSheet.Threads.GlobalShortcut.PowerShell).BeginInvoke()
 
 })
 
@@ -750,37 +1108,36 @@ $window.Add_SourceInitialized({
     })
 })
 
-if($global:CheatSheat.General.WindowType -eq 'WebView2') {
+if($global:CheatSheet.General.WindowType -eq 'WebView2') {
     $window.FindName("WebBrowser").CreationProperties = New-Object Microsoft.Web.WebView2.Wpf.CoreWebView2CreationProperties
-    $window.FindName("WebBrowser").CreationProperties.UserDataFolder = "$env:LocalAppData\CheatSheetCompanion" 
+    $window.FindName("WebBrowser").CreationProperties.UserDataFolder = "$env:LocalAppData\CheatSheetCompanion"
 }    
 
 $window.ShowDialog()
 
-$CheatSheat.Threads.ActiveWindow.PowerShell.Stop()
-$CheatSheat.Threads.ActiveWindow.Handle = $null
-$CheatSheat.Threads.ActiveWindow.PowerShell = $null
-$CheatSheat.Threads.ActiveWindow.Runspace.Close()
-$CheatSheat.Threads.ActiveWindow.Runspace.Dispose()
-$CheatSheat.Threads.ActiveWindow.Runspace = $null
+$CheatSheet.Threads.ActiveWindow.PowerShell.Stop()
+$CheatSheet.Threads.ActiveWindow.Handle = $null
+$CheatSheet.Threads.ActiveWindow.PowerShell = $null
+$CheatSheet.Threads.ActiveWindow.Runspace.Close()
+$CheatSheet.Threads.ActiveWindow.Runspace.Dispose()
+$CheatSheet.Threads.ActiveWindow.Runspace = $null
+
+$CheatSheet.Threads.GlobalShortcut.PowerShell.Stop()
+$CheatSheet.Threads.GlobalShortcut.Handle = $null
+$CheatSheet.Threads.GlobalShortcut.PowerShell = $null
+$CheatSheet.Threads.GlobalShortcut.Runspace.Close()
+$CheatSheet.Threads.GlobalShortcut.Runspace.Dispose()
+$CheatSheet.Threads.GlobalShortcut.Runspace = $null
 
 
-$CheatSheat.Threads.GlobalShortcut.PowerShell.Stop()
-$CheatSheat.Threads.GlobalShortcut.Handle = $null
-$CheatSheat.Threads.GlobalShortcut.PowerShell = $null
-$CheatSheat.Threads.GlobalShortcut.Runspace.Close()
-$CheatSheat.Threads.GlobalShortcut.Runspace.Dispose()
-$CheatSheat.Threads.GlobalShortcut.Runspace = $null
-
-
-if($null -ne $CheatSheat.Threads.MarkDownConvert.PowerShell) {
-    $CheatSheat.Threads.MarkDownConvert.PowerShell.Stop()
-    $CheatSheat.Threads.MarkDownConvert.Handle = $null
-    $CheatSheat.Threads.MarkDownConvert.PowerShell = $null
-    $CheatSheat.Threads.MarkDownConvert.Runspace.Close()
-    $CheatSheat.Threads.MarkDownConvert.Runspace.Dispose()
-    $CheatSheat.Threads.MarkDownConvert.Runspace = $null
+if($null -ne $CheatSheet.Threads.MarkDownConvert.PowerShell) {
+    $CheatSheet.Threads.MarkDownConvert.PowerShell.Stop()
+    $CheatSheet.Threads.MarkDownConvert.Handle = $null
+    $CheatSheet.Threads.MarkDownConvert.PowerShell = $null
+    $CheatSheet.Threads.MarkDownConvert.Runspace.Close()
+    $CheatSheet.Threads.MarkDownConvert.Runspace.Dispose()
+    $CheatSheet.Threads.MarkDownConvert.Runspace = $null
 }
 
 [GC]::Collect()
-[GC]::WaitForPendingFinalizers()
+[GC]::WaitForPendingFinalizers()		
