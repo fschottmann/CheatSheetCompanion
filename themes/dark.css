@@ -1,0 +1,23 @@
+/* Theme: Dunkel (an Obsidian Dark angelehnt). Überschreibt nur die Variablen aus assets/app.css. */
+:root {
+  color-scheme: dark;
+  --csc-bg: #1e1e1e;
+  --csc-text: #dcddde;
+  --csc-text-muted: #9b9b9b;
+  --csc-accent: #a88bfa;
+  --csc-accent-soft: rgba(168, 139, 250, 0.18);
+  --csc-border: #3a3a3a;
+  --csc-code-bg: #2a2a2a;
+  --csc-panel-bg: rgba(32, 32, 32, 0.97);
+  --csc-panel-bg-solid: #262626;
+  --csc-button-bg: #2e2e2e;
+  --csc-button-active-bg: #3a3a3a;
+  --csc-table-head: #2a2a2a;
+  --csc-table-alt: #232323;
+  --csc-kbd-bg: #333333;
+  --csc-mark: rgba(255, 208, 0, 0.35);
+  --csc-missing-bg: #3a2020;
+  --csc-missing-fg: #ff8a8a;
+  --csc-embed-bg: rgba(255, 255, 255, 0.04);
+  --csc-handle-bg: #555555;
+}

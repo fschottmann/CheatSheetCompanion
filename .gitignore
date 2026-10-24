@@ -1,2 +1,8 @@
-# Generation Folders
+# Generated at run time
 Output/
+.vscode/
+
+# Obsidian workspace files, if the demo vault is opened in Obsidian
+vault/.obsidian/workspace*.json
+vault/.obsidian/plugins/
+vault/.trash/
