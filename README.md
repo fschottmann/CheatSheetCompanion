@@ -59,7 +59,7 @@ Optionen:
 | Element | Funktion |
 | --- | --- |
 | Leiste oben (▲▲▲) | Klick: Fenster auf einen schmalen Streifen einklappen bzw. ausklappen. Rechtsklick: beenden. |
-| Suchfeld (Strg+K) | Fuzzy-Suche wie der Quick Switcher in Obsidian: Namen zuerst, dann Inhalte mit Textausschnitt. Pfeiltasten wählen, Enter öffnet, Escape schließt. |
+| Suchfeld (Strg+K) | Suche wie der Quick Switcher in Obsidian über Namen, Aliase und Inhalte, ein Treffer je Notiz: Enthaltener Text im Namen oder Alias zuerst, dann Inhaltstreffer mit Textausschnitt, zuletzt unscharfe Treffer. Pfeiltasten wählen, Enter öffnet, Escape schließt. |
 | ◀ ▶ | Zurück und vorwärts in den Ansichten (auch Alt+Links / Alt+Rechts oder die Maus-Daumentasten). |
 | Tabs | Kandidaten wechseln per Klick, Strg+1 bis Strg+9 oder Strg+Tab / Strg+Umschalt+Tab. |
 | ✎ | Angezeigte Notiz in Obsidian bzw. im Standardeditor öffnen. Im Text: Strg+Doppelklick (`EditOnDoubleClick`), ein normaler Doppelklick markiert nur das Wort. |
@@ -76,6 +76,7 @@ Optionen:
 | Tab-Tooltip / Statuszeile | Trefferbegründung (`ShowMatchReason`): Name im Text enthalten, ähnliches Wort des Titels, Alias oder Regel. |
 | Eingeklappter Streifen | Zeigt den Namen der aktuellen Notiz mit Wert, bei Anheftung mit Hinweis. |
 | Klick auf einen Tag | Sucht den Tag in allen Notizen. |
+| Link-Vorschau | Wer einen internen Link kurz überfährt, bekommt die Zielnotiz als Popup unter dem Link (scrollbar, mit Abschnitt-Anker, Codeblöcke mit Kopieren-Knopf), ohne die Notiz zu wechseln. Ein Balken am oberen Rand füllt sich in 1,5 Sekunden; danach ist das Popup verriegelt: Es bleibt beim Verlassen stehen, lässt sich scrollen und anklicken und schließt erst mit Escape, dem ×, einem Klick daneben oder beim Überfahren eines anderen Links. Vorher schließt es, sobald die Maus Link und Popup verlässt. Links im Popup öffnen ein weiteres Popup, gestaffelt rechts unterhalb (bis sechs Ebenen), die Titelleiste des vorherigen bleibt sichtbar. Popups lassen sich an der Titelleiste verschieben, ein Klick hinein verriegelt sofort. Escape schließt das oberste, ein Klick in ein Popup schließt die darüber. `LinkPreview = false` schaltet es ab. |
 | TOC | Inhaltsverzeichnis der aktiven Notiz ein- und ausblenden. |
 | VERLINKT (rechter Rand) | Ausfahrbare Leiste wie das TOC mit den verlinkten Erwähnungen wie in Obsidian: Notizen, die per `[[Wikilink]]`, Einbettung oder Markdown-Link auf die aktive Notiz verlinken, mit der Zeile der Erwähnung (Codeblöcke zählen nicht). Klick öffnet die Notiz. Der Griff erscheint nur, wenn es Backlinks gibt; `ShowBacklinks = false` schaltet das ab. |
 | Durchsichtigkeit | `InactiveOpacity` macht das Fenster durchscheinend, solange ein anderes Programm aktiv ist, damit man sieht, was darunter liegt. Unter der Maus, eingeklappt oder bei offener Suche ist es wieder voll sichtbar; `0` schaltet das ab, `WindowOpacity` ist die normale Deckkraft. |
@@ -100,6 +101,14 @@ Callouts `> [!warning]- Titel`, Tags `#tag`, Hervorhebungen `==Text==`, Kommenta
 Interne Links werden im Companion geöffnet. Bilder und relative Pfade werden gegen den Vault aufgelöst
 (zuerst exakter Pfad, dann relativ zur Notiz, dann kürzester Pfad mit gleichem Dateinamen, wie in Obsidian).
 Die Leiste *VERLINKT* am rechten Rand listet die Notizen auf, die auf die aktive Notiz verlinken (`ShowBacklinks`).
+
+**Dataview**: `dataviewjs`-Blöcke laufen im Companion mit einem kleinen `dv`- und `app`-Ersatz, der nur die aktuelle Notiz kennt:
+`dv.current()`, `dv.page(pfad der aktuellen Notiz)` mit allen Frontmatter-Feldern, Inline-Feldern (`key:: wert`, auch in `%% %%`-Kommentaren) und `file.name/path/folder`, dazu
+`dv.header`, `dv.paragraph` (mit Markdown, also auch Codeblöcke), `dv.span`, `dv.el`, `dv.list`, `dv.table`, `await` und
+`dv.view("ordner/name", input)`, das `name.js` oder `name/view.js` aus dem Vault lädt. `app.vault.read` bzw.
+`app.vault.adapter.read` liefern den Markdown-Text der aktuellen Notiz, `app.metadataCache.getFileCache` ihr Frontmatter.
+Blöcke, die den ganzen Vault abfragen (`dv.pages`, `dv.query`, andere Dateien lesen), und `dataview`-Abfragen (DQL)
+zeigen stattdessen einen Hinweis mit dem Quelltext.
 
 ### Themes
 
@@ -138,12 +147,14 @@ ShowMatchReason = true                             ; Trefferbegründung in Statu
 MatchIgnoreFolders = Daily, Besprechungen          ; nicht automatisch treffen, aber suchbar; einzelne Notiz: Frontmatter "csc: ignore"
 CopyHistory = 10                                   ; zuletzt kopierte Texte merken (0 = aus)
 ShowBacklinks = true                               ; Leiste VERLINKT (Notizen, die hierher verlinken)
+LinkPreview = true                                 ; Vorschau-Popup beim Überfahren interner Links
 WindowOpacity = 0.92                               ; Deckkraft des Fensters (0.3 bis 1)
 InactiveOpacity = 0.6                              ; Deckkraft, solange ein anderes Programm aktiv ist (0 = aus)
 SimilarityThreshold = 0.25
 SimilarityThresholdTitle = 0.25
 SimilarityThresholdProcess = 0.25
 SimilarityThresholdClipboard = 0.4
+ProcessWeight = 0.9                                ; Prozessname-Treffer zählen weniger als Fenstertitel-Treffer (0.1 bis 1)
 MaxCandidates = 5                                  ; angezeigte Kandidaten (Tabs)
 NGram = 3
 PollIntervalMs = 500
@@ -156,7 +167,7 @@ Debug = false
 
 [Vaults]
 ; weitere Vaults: Name = Pfad (Name = Obsidian-Vault-Name), Umschalten per Rechtsklick > Vault
-myNotes = D:\pfad\zum\anderen\vault
+work = D:\pfad\zum\anderen\vault
 
 [Rules]
 ; feste Zuordnung Programm -> Notiz (immer zuerst, Wert 1.00): Prozessname oder title:<Regex auf den Fenstertitel>
@@ -164,15 +175,20 @@ mstsc = RDP
 title:.*Visual Studio Code$ = VSCode
 ```
 
+Persönliche Einstellungen (eigener Vault-Pfad, Sprache, Ignore-Ordner) gehören in `ini\config.local.ini`: gleiche Abschnitte und
+Schlüssel, überschreibt nur die dort genannten Werte und ist in `.gitignore` eingetragen, bleibt also bei Updates und Commits unberührt.
+`IgnoreFolders` nimmt einfache Ordnernamen (gelten in jeder Tiefe) und relative Pfade wie `archive\alte Notizen` (genau dieser Ordner samt Unterordnern).
+Betroffen sind nur die Notizen dort; Bilder und andere Anhänge in diesen Ordnern bleiben für Einbettungen auffindbar.
+
 Schalter, Anheftung, Theme, Vault, Zoomstufe, zuletzt angezeigte Notizen, zuletzt kopierte Texte sowie Fensterposition und -größe werden in
 `%LocalAppData%\CheatSheetCompanion\state.json` gespeichert und beim nächsten Start übernommen.
 
 ## Funktionsweise
 
-- Beim Start werden alle Notizen nach `Output\<Vault>\` konvertiert; danach nur noch geänderte (Cache nach Änderungszeit).
+- Beim ersten Start werden alle Notizen nach `Output\<Vault>\` konvertiert; danach nur noch geänderte (Cache nach Änderungszeit, `index.cache` merkt sich den Dateibestand). Das Einlesen des Vaults (Dateiliste, Notiztexte, Aliase, Links) läuft parallel in C#; ein unveränderter Vault mit 6 000 Dateien ist in gut einer Sekunde indiziert, die Phasen stehen bei `Debug = true` im Log.
 - Ein Dateiwächter erkennt neue, geänderte und gelöschte Notizen und aktualisiert Index und Anzeige.
 - Das aktive Fenster wird alle `PollIntervalMs` Millisekunden geprüft; ein Wechsel löst die Suche aus, sobald der Titel kurz stabil ist.
-- Die Ähnlichkeit ist ein Dice-Koeffizient über Zeichen-N-Gramme (in C#, kulturunabhängig). Enthält der Text den Notiznamen, zählt das als 1.00.
+- Die Ähnlichkeit ist ein Dice-Koeffizient über Zeichen-N-Gramme (in C#, kulturunabhängig). Enthält der Text den Notiznamen, zählt das als 1.00. Bei gleichem Wert gewinnt der längere getroffene Name oder Alias, also die speziellere Notiz. Treffer über den Prozessnamen werden mit `ProcessWeight` (Vorgabe 0.9) abgeschwächt, damit "Obsidian" als Prozess keine Notiz mit "Obsidian" im Namen über die im Fenstertitel genannte hebt.
 - Aliase aus dem Frontmatter (`aliases: [Browser, Chrome]`) zählen wie Notiznamen. So lässt sich eine Notiz gezielt an Fenstertitel oder Prozessnamen binden; der Companion schreibt sie auf Wunsch selbst (Rechtsklick > Alias hinzufügen).
 - `[Rules]` ordnen ein Programm fest einer Notiz zu, unabhängig von der Ähnlichkeit. Aliase gehören zur Notiz (wandern mit dem Vault), Regeln zur Installation.
 - Notizen in `MatchIgnoreFolders` oder mit `csc: ignore` im Frontmatter (etwa Daily Notes, Besprechungen) liefern keine Zufallstreffer, bleiben aber über die Suche erreichbar.

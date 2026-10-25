@@ -214,6 +214,37 @@ details.csc-frontmatter td:first-child { color: var(--csc-text-muted); white-spa
 #csc-copy-list .csc-recopy:hover { border-color: var(--csc-accent); }
 #csc-copy-list .csc-recopy.done { border-color: var(--csc-accent); background: var(--csc-accent-soft); }
 
+/* ---------- Dataview (dataviewjs-Blöcke mit dv-Ersatz, nur die aktuelle Notiz) ---------- */
+.csc-dataview { border-left: 3px solid var(--csc-accent); padding: 2px 12px; margin: 0 0 1em; }
+.csc-dataview > :first-child { margin-top: 0; }
+.csc-dataview > :last-child { margin-bottom: 0; }
+.csc-dataview.failed { border-color: var(--csc-border); }
+.csc-dataview.failed pre { margin: 0; font-size: .85em; opacity: .75; }
+.csc-dv-note { color: var(--csc-text-muted); font-size: .85em; margin: 0 0 4px; }
+/* ---------- Vorschau beim Überfahren interner Links ---------- */
+.csc-preview {
+  position: fixed; z-index: 80; display: none; overflow: auto; font-size: .9em;
+  background: var(--csc-panel-bg-solid); color: var(--csc-text); border: 1px solid var(--csc-border); border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .28);
+}
+.csc-preview.open { display: block; }
+.csc-preview-bar { position: sticky; top: 0; z-index: 2; height: 3px; width: 0; background: var(--csc-accent); transition: width 1.5s linear; }
+.csc-preview.arming .csc-preview-bar { width: 100%; }
+.csc-preview.locked .csc-preview-bar { opacity: .35; }
+.csc-preview-title { position: sticky; top: 3px; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--csc-panel-bg-solid); font-weight: 600; padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--csc-border); }
+.csc-preview-title { cursor: move; user-select: none; }
+.csc-preview.dragging { opacity: .92; }
+.csc-preview-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.csc-preview-close { font: inherit; font-size: 15px; line-height: 1; padding: 0 6px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--csc-text-muted); cursor: pointer; visibility: hidden; }
+.csc-preview.locked .csc-preview-close { visibility: visible; }
+.csc-preview-close:hover { border-color: var(--csc-accent); color: var(--csc-accent); }
+.csc-preview-body { padding: 8px 12px 10px; }
+.csc-preview-body > :first-child { margin-top: 0; }
+.csc-preview-body h1 { font-size: 1.35em; } .csc-preview-body h2 { font-size: 1.2em; } .csc-preview-body h3 { font-size: 1.05em; }
+.csc-preview-body img { max-width: 100%; }
+.csc-dv-p { margin: 0 0 .6em; }
+.csc-dv-p > p { margin: 0 0 .6em; }
+
 /* Während "Kopieren als…" (Strg+Umschalt+C) sind die Codeblock-Knöpfe unsichtbar, damit sie nicht im Text landen */
 body.csc-copying .csc-copy-code { display: none !important; }
 

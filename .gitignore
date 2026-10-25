@@ -2,6 +2,9 @@
 Output/
 .vscode/
 
+# Personal settings (vault path, language ...) override ini\config.ini
+ini/config.local.ini
+
 # Obsidian workspace files, if the demo vault is opened in Obsidian
 vault/.obsidian/workspace*.json
 vault/.obsidian/plugins/

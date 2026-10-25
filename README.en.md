@@ -59,7 +59,7 @@ Options:
 | Element | Function |
 | --- | --- |
 | Top bar (▲▲▲) | Click: collapse the window to a thin strip and back. Right-click: quit. |
-| Search box (Ctrl+K) | Fuzzy search like Obsidian's quick switcher: names first, then contents with a text snippet. Arrow keys select, Enter opens, Escape closes. |
+| Search box (Ctrl+K) | Search like Obsidian's quick switcher over names, aliases and contents, one hit per note: text contained in a name or alias first, then content hits with a snippet, fuzzy hits last. Arrow keys select, Enter opens, Escape closes. |
 | ◀ ▶ | Back and forward through the views (also Alt+Left / Alt+Right or the mouse thumb buttons). |
 | Tabs | Switch candidates by click, Ctrl+1 to Ctrl+9 or Ctrl+Tab / Ctrl+Shift+Tab. |
 | ✎ | Open the shown note in Obsidian or the default editor. In the text: Ctrl+double click (`EditOnDoubleClick`); a plain double click only selects the word. |
@@ -76,6 +76,7 @@ Options:
 | Tab tooltip / status line | Match reason (`ShowMatchReason`): name contained in the text, similar word of the title, alias or rule. |
 | Collapsed strip | Shows the name of the current note with its score, with a hint when pinned. |
 | Click on a tag | Searches the tag in all notes. |
+| Link preview | Hovering an internal link for a moment shows the target note as a popup below the link (scrollable, with section anchor, code blocks with copy button) without leaving the note. A bar at the top fills within 1.5 seconds; after that the popup is locked: it stays when the mouse leaves, can be scrolled and clicked, and closes only with Escape, its ×, a click elsewhere or by hovering another link. Before that it closes as soon as the mouse leaves link and popup. Links inside a popup open another popup, cascaded to the lower right (up to six levels), the previous title bar stays visible. Popups can be dragged by the title bar, a click into one locks it at once. Escape closes the topmost, a click into a popup closes those above it. `LinkPreview = false` turns it off. |
 | TOC | Show or hide the table of contents of the active note. |
 | LINKED (right edge) | Slide-out panel like the TOC with the linked mentions as in Obsidian: notes that link to the active note via `[[wikilink]]`, embed or Markdown link, with the line of the mention (code blocks do not count). Click opens the note. The handle only appears when there are backlinks; `ShowBacklinks = false` turns it off. |
 | Transparency | `InactiveOpacity` makes the window see-through while another program is active, so you can see what lies beneath. Under the mouse, collapsed or with the search open it is fully visible again; `0` turns it off, `WindowOpacity` is the normal opacity. |
@@ -100,6 +101,14 @@ callouts `> [!warning]- Title`, tags `#tag`, highlights `==text==`, comments `%%
 Internal links open in the companion. Images and relative paths are resolved against the vault
 (exact path first, then relative to the note, then the shortest path with the same file name, as in Obsidian).
 The *LINKED* panel at the right edge lists the notes that link to the active note (`ShowBacklinks`).
+
+**Dataview**: `dataviewjs` blocks run in the companion with a small `dv` and `app` replacement that knows the current note only:
+`dv.current()`, `dv.page(path of the current note)` with all front matter fields, inline fields (`key:: value`, also inside `%% %%` comments) and `file.name/path/folder`, plus
+`dv.header`, `dv.paragraph` (with Markdown, so code blocks too), `dv.span`, `dv.el`, `dv.list`, `dv.table`, `await` and
+`dv.view("folder/name", input)`, which loads `name.js` or `name/view.js` from the vault. `app.vault.read` and
+`app.vault.adapter.read` return the Markdown text of the current note, `app.metadataCache.getFileCache` its front matter.
+Blocks that query the whole vault (`dv.pages`, `dv.query`, reading other files) and `dataview` queries (DQL) show a hint
+with the source instead.
 
 ### Themes
 
@@ -138,12 +147,14 @@ ShowMatchReason = true                             ; match reason in the status 
 MatchIgnoreFolders = Daily, Meetings               ; never matched automatically but searchable; single note: front matter "csc: ignore"
 CopyHistory = 10                                   ; remember copied texts (0 = off)
 ShowBacklinks = true                               ; LINKED panel (notes linking here)
+LinkPreview = true                                 ; popup with the target note when hovering an internal link
 WindowOpacity = 0.92                               ; window opacity (0.3 to 1)
 InactiveOpacity = 0.6                              ; opacity while another program is active (0 = off)
 SimilarityThreshold = 0.25
 SimilarityThresholdTitle = 0.25
 SimilarityThresholdProcess = 0.25
 SimilarityThresholdClipboard = 0.4
+ProcessWeight = 0.9                                ; process name hits count less than window title hits (0.1 to 1)
 MaxCandidates = 5                                  ; candidates shown (tabs)
 NGram = 3
 PollIntervalMs = 500
@@ -156,7 +167,7 @@ Debug = false
 
 [Vaults]
 ; more vaults: Name = path (name = Obsidian vault name), switch with right-click > Vault
-myNotes = D:\path\to\other\vault
+work = D:\path\to\other\vault
 
 [Rules]
 ; fixed assignment program -> note (always first, score 1.00): process name or title:<regex on the window title>
@@ -164,15 +175,20 @@ mstsc = Remote Desktop
 title:.*Visual Studio Code$ = Visual Studio Code
 ```
 
+Personal settings (your vault path, language, ignore folders) belong in `ini\config.local.ini`: same sections and keys, it
+overrides only the values it contains and is listed in `.gitignore`, so updates and commits leave it alone.
+`IgnoreFolders` takes plain folder names (matched at any depth) and relative paths like `archive\old notes` (exactly that folder and everything below).
+Only the notes there are affected; images and other attachments in those folders stay resolvable for embeds.
+
 Switches, pins, theme, vault, zoom level, recently shown notes, recently copied texts as well as window position and size are
 stored in `%LocalAppData%\CheatSheetCompanion\state.json` and restored at the next start.
 
 ## How it works
 
-- At start-up all notes are converted to `Output\<vault>\`; afterwards only changed ones (cache by modification time).
+- At the first start all notes are converted to `Output\<vault>\`; afterwards only changed ones (cache by modification time, `index.cache` remembers the file set). Reading the vault (file list, note texts, aliases, links) runs in parallel in C#; an unchanged vault with 6,000 files is indexed in about a second, the phases are logged with `Debug = true`.
 - A file watcher detects new, changed and deleted notes and updates index and display.
 - The active window is checked every `PollIntervalMs` milliseconds; a change triggers the search as soon as the title is stable for a moment.
-- The similarity is a Dice coefficient over character n-grams (in C#, culture independent). If the text contains the note name, that counts as 1.00.
+- The similarity is a Dice coefficient over character n-grams (in C#, culture independent). If the text contains the note name, that counts as 1.00. With equal scores the longer matched name or alias wins, i.e. the more specific note. Hits through the process name are weakened by `ProcessWeight` (default 0.9), so "Obsidian" as a process cannot lift a note with "Obsidian" in its name above the one named in the window title.
 - Aliases from the front matter (`aliases: [Browser, Chrome]`) count like note names. This binds a note to window titles or process names; the companion writes them for you on request (right-click > Add alias).
 - `[Rules]` bind a program to a note regardless of similarity. Aliases belong to the note (travel with the vault), rules to the installation.
 - Notes in `MatchIgnoreFolders` or with `csc: ignore` in the front matter (daily notes, meetings) never produce random matches but stay reachable through the search.

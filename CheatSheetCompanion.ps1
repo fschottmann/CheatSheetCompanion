@@ -2,7 +2,7 @@
 
 <#PSScriptInfo
 
-    .VERSION 3.3.0
+    .VERSION 3.4.0
 
     .GUID 1a0524f5-edba-4780-b562-6097e428b673
 
@@ -11,6 +11,25 @@
     .COPYRIGHT @2024-2026 Frank Schottmann
 
     .RELEASENOTES
+    Version 3.4.0
+    - Search: aliases are searched like names, substring hits always rank above fuzzy hits, content hits in between;
+      the whole pass runs in C# and typing is debounced (large vaults).
+    - dataviewjs blocks run with a small dv and app replacement (current note only: dv.current, dv.page, header,
+      paragraph with Markdown and HTML, list, table, el, dv.view loading scripts from the vault, app.vault.read of
+      the current note, await); inline fields ("key:: value", also inside %% comments) are available like front
+      matter; vault-wide queries and DQL blocks show a hint instead of raw code; works in preview popups.
+    - Link preview: hovering an internal link shows the target note in a popup (LinkPreview = false turns it off);
+      after a short progress bar it is locked (clickable, scrollable) until Escape, its close button or a click
+      elsewhere; links inside a popup open further popups (cascaded stack of up to six levels, draggable).
+    - Ranking: ProcessWeight (default 0.9) keeps the note named in the window title ahead of notes that merely
+      contain the process name; equal scores prefer the longer matched name or alias.
+    - IgnoreFolders accepts relative paths ("archive\old notes") and drops the notes of those folders only; images
+      there stay resolvable for embeds. ini\config.local.ini overrides config.ini for personal settings (not in git).
+    - Start-up with large vaults: vault walk, parallel note reading, link extraction and backlinks run in C#, and an
+      unchanged vault converts nothing (Output\<vault>\index.cache remembers the file set; before, every start
+      re-converted all notes). Phase timings in the debug log.
+    - Fenced code detection tolerates CR before LF; the page can write diagnostics to the log.
+
     Version 3.3.0
     - UI texts come from lang\<code>.ini (Language = auto|de|en|...), German built in as fallback.
     - Pin reworked: pinned notes (several) stay as marked tabs while matching goes on, the best match is shown
@@ -224,6 +243,8 @@ $script:TextDefault = @{
     'page.backlinks'         = 'Verlinkt von'
     'page.backlinksTip'      = 'Notizen, die auf diese Notiz verlinken (Klick öffnet die Notiz)'
     'page.linksHandle'       = 'VERLINKT'
+    'page.dataviewOnly'      = 'Dataview-Abfrage: nur in Obsidian verfügbar'
+    'page.dataviewFailed'    = 'Dataview-Block außerhalb von Obsidian nicht ausführbar'
     'strip.pinned'           = '[angeheftet]'
     'menu.copy'              = 'In Zwischenablage kopieren'
     'menu.copyAs'            = 'Kopieren als…'
@@ -268,6 +289,7 @@ $script:TextDefault = @{
     'ui.searchTip'           = 'Notiz suchen: Name oder Inhalt (Strg+K). Pfeiltasten + Enter öffnen.'
     'ui.searchHint'          = 'Suchen…  (Strg+K)'
     'ui.contentPrefix'       = 'Inhalt: '
+    'ui.aliasPrefix'         = 'Alias: '
     'dlg.cancel'             = 'Abbrechen'
     'dlg.aliasTitle'         = 'Alias hinzufügen'
     'dlg.aliasFor'           = 'Alias für "{0}":'
@@ -354,6 +376,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace CheatSheetCompanionHelper {
 
@@ -476,7 +499,9 @@ namespace CheatSheetCompanionHelper {
                 string why; double s = Score(names[i], target, n, out why);
                 if (s >= threshold) list.Add(new Match(i, Math.Round(s, 4), why));
             }
-            list.Sort((x, y) => { int c = y.Score.CompareTo(x.Score); if (c != 0) return c; return string.Compare(names[x.Index], names[y.Index], StringComparison.OrdinalIgnoreCase); });
+            // equal scores: the longer matched name wins (a title containing "Programming - Active Directory Administration"
+            // must prefer that note over "Active Directory"), then alphabetical for determinism
+            list.Sort((x, y) => { int c = y.Score.CompareTo(x.Score); if (c != 0) return c; c = names[y.Index].Length.CompareTo(names[x.Index].Length); if (c != 0) return c; return string.Compare(names[x.Index], names[y.Index], StringComparison.OrdinalIgnoreCase); });
             if (list.Count > top) list.RemoveRange(top, list.Count - top);
             return list.ToArray();
         }
@@ -502,9 +527,10 @@ namespace CheatSheetCompanionHelper {
         static List<int> MatchToken(string q, string t, out double score) {
             score = 0;
             var res = new List<int>();
+            // substring hits always outrank subsequence hits (which sum per character and could exceed them for long tokens)
             int idx = t.IndexOf(q, StringComparison.Ordinal);
             if (idx >= 0) {
-                score = 100 + (idx == 0 ? 40 : (IsWordStart(t, idx) ? 25 : 0)) - idx * 0.3;
+                score = 1000 + (idx == 0 ? 40 : (IsWordStart(t, idx) ? 25 : 0)) - idx * 0.3;
                 for (int i = 0; i < q.Length; i++) res.Add(idx + i);
                 return res;
             }
@@ -519,6 +545,241 @@ namespace CheatSheetCompanionHelper {
                 res.Add(i); last = i; from = i + 1;
             }
             return res;
+        }
+    }
+
+    // Quick switcher search in one pass: names, aliases and contents, one hit per note (its best), top 'max'.
+    // Kind: 0 = name, 1 = alias, 2 = content. Scores: substring in name/alias >= 1000, content 500, fuzzy below.
+    public class SearchHit { public int Index; public int Kind; public double Score; public int[] Positions; public string Detail; }
+    public static class SearchEngine {
+        public static SearchHit[] Find(string[] display, string[][] aliases, string[] texts, string query, int max) {
+            var hits = new List<SearchHit>();
+            if (display == null || string.IsNullOrWhiteSpace(query)) return hits.ToArray();
+            string q = query.Trim();
+            string[] tokens = q.ToLowerInvariant().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < display.Length; i++) {
+                SearchHit best = null;
+                var m = Fuzzy.Match(q, display[i]);
+                if (m != null) best = new SearchHit { Index = i, Kind = 0, Score = m.Score, Positions = m.Positions, Detail = null };
+                if (aliases != null && i < aliases.Length && aliases[i] != null) {
+                    foreach (string a in aliases[i]) {
+                        if (string.IsNullOrEmpty(a)) continue;
+                        var am = Fuzzy.Match(q, a);
+                        if (am != null && (best == null || am.Score > best.Score)) best = new SearchHit { Index = i, Kind = 1, Score = am.Score, Positions = new int[0], Detail = a };
+                    }
+                }
+                if (texts != null && i < texts.Length && !string.IsNullOrEmpty(texts[i]) && (best == null || best.Score < 500)) {
+                    string t = texts[i]; int first = -1; bool ok = true;
+                    foreach (string tok in tokens) {
+                        int p = t.IndexOf(tok, StringComparison.OrdinalIgnoreCase);
+                        if (p < 0) { ok = false; break; }
+                        if (first < 0 || p < first) first = p;
+                    }
+                    if (ok) {
+                        int start = Math.Max(0, first - 30); int len = Math.Min(90, t.Length - start);
+                        string snippet = System.Text.RegularExpressions.Regex.Replace(t.Substring(start, len), "\\s+", " ").Trim();
+                        best = new SearchHit { Index = i, Kind = 2, Score = 500.0 - first * 0.001, Positions = new int[0], Detail = (start > 0 ? "…" : "") + snippet + "…" };
+                    }
+                }
+                if (best != null) hits.Add(best);
+            }
+            hits.Sort((x, y) => { int c = y.Score.CompareTo(x.Score); if (c != 0) return c; return string.Compare(display[x.Index], display[y.Index], StringComparison.OrdinalIgnoreCase); });
+            if (hits.Count > max) hits.RemoveRange(max, hits.Count - max);
+            return hits.ToArray();
+        }
+    }
+
+    // One vault file. Created by VaultScanner; PowerShell reads and writes the public fields like a PSCustomObject.
+    public class VaultEntry {
+        public string Name, Rel, Full, Ext, PathKey, Key, Html, Display, Folder, Error;
+        public string Text = string.Empty;
+        public bool IsNote, IsImage, Matchable = true;   // Matchable false: MatchIgnoreFolders or front matter "csc: ignore" (still searchable)
+        public DateTime LastWrite;
+        public string[] Aliases = new string[0], LinkTargets = new string[0], LinkLines = new string[0];
+    }
+    public class VaultScanResult {
+        public VaultEntry[] Entries;
+        public Dictionary<string, VaultEntry> ByKey = new Dictionary<string, VaultEntry>(StringComparer.Ordinal);
+        public Dictionary<string, VaultEntry> ByPath = new Dictionary<string, VaultEntry>(StringComparer.Ordinal);
+        public Dictionary<string, List<VaultEntry>> NotesByName = new Dictionary<string, List<VaultEntry>>(StringComparer.Ordinal);
+        public Dictionary<string, List<VaultEntry>> FilesByName = new Dictionary<string, List<VaultEntry>>(StringComparer.Ordinal);
+        public string Signature;   // SHA-1 over all path keys: changes when files appear or disappear
+    }
+    public class BacklinkSource { public VaultEntry Source; public List<string> Contexts = new List<string>(); }
+
+    // Walks the vault (skipping .obsidian, .trash, .git entirely and the notes of IgnoreFolders), reads every note in
+    // parallel (text, front matter aliases, "csc: ignore", link targets with their lines) and builds the lookup maps.
+    // Pure C#: nothing of PowerShell runs on the worker threads.
+    public static class VaultScanner {
+        static readonly Regex Front = new Regex(@"\A---\r?\n(.*?)\r?\n---[ \t]*(\r?\n|\z)", RegexOptions.Singleline | RegexOptions.Compiled);
+        static readonly Regex IgnoreRx = new Regex(@"^csc(?:-match)?\s*:\s*(ignore|false|no|off)\s*$", RegexOptions.Multiline | RegexOptions.Compiled);
+        static readonly Regex Fence = new Regex(@"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*\r?$", RegexOptions.Multiline | RegexOptions.Singleline | RegexOptions.Compiled);
+        static readonly Regex Inline = new Regex(@"`[^`\r\n]*`", RegexOptions.Compiled);
+        static readonly Regex Wiki = new Regex(@"!?\[\[([^\[\]\|#]*)(?:#[^\[\]\|]*)?(?:\\?\|[^\[\]]*)?\]\]", RegexOptions.Compiled);
+        static readonly Regex MdLink = new Regex(@"(?<!!)\[[^\]]*\]\(([^)\s]+?\.md)(?:#[^)]*)?\)", RegexOptions.Compiled);
+        static readonly string[] Builtin = { ".obsidian", ".trash", ".git" };
+
+        public static VaultScanResult Scan(string root, string[] ignoreNames, string[] ignorePaths, string[] matchIgnoreFolders, string outputDir, string[] imageExts) {
+            root = root.TrimEnd('\\');
+            var names = new HashSet<string>(ignoreNames ?? new string[0], StringComparer.OrdinalIgnoreCase);
+            var paths = new List<string>(); foreach (string p in ignorePaths ?? new string[0]) paths.Add(p.Replace('/', '\\').Trim('\\'));
+            var mif = new List<string>(); foreach (string p in matchIgnoreFolders ?? new string[0]) mif.Add(p.Replace('/', '\\').Trim('\\'));
+            var images = new HashSet<string>(imageExts ?? new string[0], StringComparer.OrdinalIgnoreCase);
+            var list = new List<VaultEntry>();
+            Walk(new DirectoryInfo(root), root, "", names, paths, list);
+            var r = new VaultScanResult();
+            foreach (var e in list) {
+                e.Ext = Path.GetExtension(e.Rel).ToLowerInvariant();
+                e.IsNote = e.Ext == ".md";
+                e.IsImage = images.Contains(e.Ext);
+                e.PathKey = e.Rel.Replace('\\', '/').ToLowerInvariant();
+                e.Key = e.IsNote ? e.PathKey.Substring(0, e.PathKey.Length - 3) : e.PathKey;
+                e.Name = Path.GetFileNameWithoutExtension(e.Rel);
+                e.Display = e.Name;
+                e.Folder = Path.GetDirectoryName(e.Rel) ?? string.Empty;
+                e.Html = e.IsNote ? Path.Combine(outputDir, e.Rel.Substring(0, e.Rel.Length - 3) + ".html") : null;
+                if (e.IsNote) {
+                    foreach (string mi in mif) { if (e.Folder.Equals(mi, StringComparison.OrdinalIgnoreCase) || e.Folder.StartsWith(mi + "\\", StringComparison.OrdinalIgnoreCase)) { e.Matchable = false; break; } }
+                }
+            }
+            var notes = new List<VaultEntry>(); foreach (var e in list) if (e.IsNote) notes.Add(e);
+            System.Threading.Tasks.Parallel.ForEach(notes, Fill);
+            var sig = new StringBuilder();
+            foreach (var e in list) {
+                r.ByPath[e.PathKey] = e;
+                if (sig.Length > 0) sig.Append('|');
+                sig.Append(e.PathKey);
+                string fn = Path.GetFileName(e.Rel).ToLowerInvariant();
+                List<VaultEntry> l;
+                if (!r.FilesByName.TryGetValue(fn, out l)) { l = new List<VaultEntry>(); r.FilesByName[fn] = l; }
+                l.Add(e);
+                if (e.IsNote) {
+                    r.ByKey[e.Key] = e;
+                    string n = e.Name.ToLowerInvariant();
+                    if (!r.NotesByName.TryGetValue(n, out l)) { l = new List<VaultEntry>(); r.NotesByName[n] = l; }
+                    l.Add(e);
+                }
+            }
+            foreach (var kv in r.NotesByName) { if (kv.Value.Count > 1) foreach (var e in kv.Value) if (e.Folder.Length > 0) e.Display = e.Name + " (" + e.Folder + ")"; }
+            using (var sha = System.Security.Cryptography.SHA1.Create()) r.Signature = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(sig.ToString()))).Replace("-", "");
+            r.Entries = list.ToArray();
+            return r;
+        }
+        static void Walk(DirectoryInfo dir, string root, string relDir, HashSet<string> names, List<string> paths, List<VaultEntry> list) {
+            IEnumerable<FileSystemInfo> items;
+            try { items = dir.EnumerateFileSystemInfos(); } catch { return; }
+            bool notesIgnored = false;
+            if (relDir.Length > 0) {
+                foreach (string part in relDir.Split('\\')) if (names.Contains(part)) { notesIgnored = true; break; }
+                if (!notesIgnored) foreach (string ip in paths) if (relDir.Equals(ip, StringComparison.OrdinalIgnoreCase) || relDir.StartsWith(ip + "\\", StringComparison.OrdinalIgnoreCase)) { notesIgnored = true; break; }
+            }
+            foreach (var item in items) {
+                var sub = item as DirectoryInfo;
+                if (sub != null) {
+                    if (Array.IndexOf(Builtin, sub.Name.ToLowerInvariant()) >= 0) continue;
+                    Walk(sub, root, relDir.Length == 0 ? sub.Name : relDir + "\\" + sub.Name, names, paths, list);
+                    continue;
+                }
+                var f = item as FileInfo;
+                if (f == null) continue;
+                if (notesIgnored && f.Extension.Equals(".md", StringComparison.OrdinalIgnoreCase)) continue;
+                list.Add(new VaultEntry { Full = f.FullName, Rel = relDir.Length == 0 ? f.Name : relDir + "\\" + f.Name, LastWrite = f.LastWriteTimeUtc });
+            }
+        }
+        // text, aliases, ignore flag and link targets (code blocks and inline code skipped) of one note
+        public static void Fill(VaultEntry n) {
+            try { n.Text = File.ReadAllText(n.Full); } catch (Exception ex) { n.Error = ex.Message; return; }
+            if (n.Text.StartsWith("---")) {
+                var fm = Front.Match(n.Text);
+                if (fm.Success) { string front = fm.Groups[1].Value; if (IgnoreRx.IsMatch(front)) n.Matchable = false; n.Aliases = ListProperty(front, "aliases"); }
+            }
+            if (n.Text.IndexOf('[') >= 0) {
+                string t = Inline.Replace(Fence.Replace(n.Text, string.Empty), string.Empty);
+                var targets = new List<string>(); var lines = new List<string>();
+                foreach (string raw in t.Split('\n')) {
+                    if (raw.IndexOf('[') < 0) continue;
+                    string line = raw.TrimEnd('\r');
+                    foreach (System.Text.RegularExpressions.Match w in Wiki.Matches(line)) { string tg = w.Groups[1].Value.Trim(); if (tg.Length > 0) { targets.Add(tg); lines.Add(line); } }
+                    foreach (System.Text.RegularExpressions.Match w in MdLink.Matches(line)) { string tg = w.Groups[1].Value.Trim(); if (tg.Length > 0) { targets.Add(tg); lines.Add(line); } }
+                }
+                n.LinkTargets = targets.ToArray(); n.LinkLines = lines.ToArray();
+            }
+        }
+        // Obsidian link resolution: exact key, exact path, relative to the linking note, then shortest path with that name
+        public static VaultEntry Resolve(VaultScanResult r, string target, string fromRel) {
+            if (target == null) return null;
+            string t = target.Trim().Replace('\\', '/').TrimStart('/');
+            if (t.StartsWith("./")) t = t.Substring(2);
+            if (t.Length == 0) return null;
+            try { t = Uri.UnescapeDataString(t); } catch { }
+            string tl = t.ToLowerInvariant();
+            string keyNoExt = tl.EndsWith(".md") ? tl.Substring(0, tl.Length - 3) : tl;
+            VaultEntry e;
+            if (r.ByKey.TryGetValue(keyNoExt, out e)) return e;
+            if (r.ByPath.TryGetValue(tl, out e)) return e;
+            if (!string.IsNullOrEmpty(fromRel)) {
+                string dir = Path.GetDirectoryName(fromRel);
+                if (!string.IsNullOrEmpty(dir)) {
+                    string dl = dir.Replace('\\', '/').ToLowerInvariant();
+                    if (r.ByKey.TryGetValue(dl + "/" + keyNoExt, out e)) return e;
+                    if (r.ByPath.TryGetValue(dl + "/" + tl, out e)) return e;
+                }
+            }
+            string baseName = tl.Substring(tl.LastIndexOf('/') + 1), baseNoExt = keyNoExt.Substring(keyNoExt.LastIndexOf('/') + 1);
+            List<VaultEntry> l;
+            if (r.NotesByName.TryGetValue(baseNoExt, out l)) return Shortest(l);
+            if (r.FilesByName.TryGetValue(baseName, out l)) return Shortest(l);
+            return null;
+        }
+        static VaultEntry Shortest(List<VaultEntry> l) { VaultEntry best = null; foreach (var e in l) if (best == null || e.Rel.Length < best.Rel.Length) best = e; return best; }
+        // target note key -> linking notes with up to 5 mention lines each (self links ignored)
+        public static Dictionary<string, List<BacklinkSource>> Backlinks(VaultScanResult r) {
+            var map = new Dictionary<string, Dictionary<string, BacklinkSource>>(StringComparer.Ordinal);
+            var memo = new Dictionary<string, VaultEntry>(StringComparer.Ordinal);
+            foreach (var n in r.Entries) {
+                if (!n.IsNote || n.LinkTargets.Length == 0) continue;
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                for (int k = 0; k < n.LinkTargets.Length; k++) {
+                    string t = n.LinkTargets[k], line = n.LinkLines[k];
+                    string mk = n.Folder + "|" + t;
+                    VaultEntry e;
+                    if (!memo.TryGetValue(mk, out e)) { e = Resolve(r, t, n.Rel); memo[mk] = e; }
+                    if (e == null || !e.IsNote || e.Key == n.Key) continue;
+                    if (!seen.Add(e.Key + "|" + line)) continue;
+                    Dictionary<string, BacklinkSource> bySource;
+                    if (!map.TryGetValue(e.Key, out bySource)) { bySource = new Dictionary<string, BacklinkSource>(StringComparer.Ordinal); map[e.Key] = bySource; }
+                    BacklinkSource bs;
+                    if (!bySource.TryGetValue(n.Key, out bs)) { bs = new BacklinkSource { Source = n }; bySource[n.Key] = bs; }
+                    if (bs.Contexts.Count < 5) bs.Contexts.Add(line.Trim());
+                }
+            }
+            var result = new Dictionary<string, List<BacklinkSource>>(StringComparer.Ordinal);
+            foreach (var kv in map) result[kv.Key] = new List<BacklinkSource>(kv.Value.Values);
+            return result;
+        }
+        // "key: [a, b]" or "key:" followed by "- item" lines (same rules as Get-FrontmatterList in the script)
+        public static string[] ListProperty(string front, string key) {
+            var items = new List<string>();
+            string[] lines = front.Split('\n');
+            for (int i = 0; i < lines.Length; i++) {
+                string line = lines[i].TrimEnd('\r');
+                var m = Regex.Match(line, "^" + Regex.Escape(key) + @"\s*:\s*(.*)$");
+                if (!m.Success) continue;
+                string inline = m.Groups[1].Value.Trim();
+                if (inline.StartsWith("[") && inline.EndsWith("]")) {
+                    foreach (string part in inline.Substring(1, inline.Length - 2).Split(',')) { string v = part.Trim().Trim('"', '\''); if (v.Length > 0) items.Add(v); }
+                }
+                else if (inline.Length > 0) { items.Add(inline.Trim('"', '\'')); }
+                else {
+                    for (int j = i + 1; j < lines.Length; j++) {
+                        var d = Regex.Match(lines[j].TrimEnd('\r'), @"^\s*-\s*(.+)$");
+                        if (!d.Success) break;
+                        string v = d.Groups[1].Value.Trim().Trim('"', '\''); if (v.Length > 0) items.Add(v);
+                    }
+                }
+                break;
+            }
+            return items.ToArray();
         }
     }
 
@@ -598,6 +859,15 @@ $script:App.ThemeDir   = Join-Path $script:App.Root 'themes'
 New-Item -ItemType Directory -Path $script:App.DataDir, $script:App.OutputRoot -Force | Out-Null
 
 $script:Config = Get-IniContent -Path (Join-Path $script:App.Root 'ini\config.ini')
+# ini\config.local.ini (not in git) overrides single keys: personal vault path, language, ignore folders ... stay out of the repo
+$localIni = Join-Path $script:App.Root 'ini\config.local.ini'
+if (Test-Path -LiteralPath $localIni) {
+    $local = Get-IniContent -Path $localIni
+    foreach ($sec in $local.Keys) {
+        if (-not $script:Config.Contains($sec)) { $script:Config[$sec] = [ordered]@{} }
+        foreach ($k in $local[$sec].Keys) { $script:Config[$sec][$k] = $local[$sec][$k] }
+    }
+}
 Initialize-Language -Requested ([string](Get-Setting -Section Configuration -Key Language -Default 'auto'))
 
 $script:App.Debug = (Get-Setting -Section Configuration -Key Debug -Default $false) -or ($VerbosePreference -eq 'Continue')
@@ -606,12 +876,20 @@ $script:App.NewNoteFolder = Get-Setting -Section Configuration -Key NewNoteFolde
 $script:App.NewNoteTemplate = Get-Setting -Section Configuration -Key NewNoteTemplate -Default ''
 $script:App.NewNoteNameMaxChars = [Math]::Max(10, (Get-Setting -Section Configuration -Key NewNoteNameMaxChars -Default 60))
 $script:App.IgnoreFolders = @('.obsidian', '.trash', '.git') + @((Get-Setting -Section Configuration -Key IgnoreFolders -Default '') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+# HTML cache: a new script version re-converts every note once (changed markup, e.g. the note meta data for Dataview)
+$cacheStamp = Join-Path $script:App.OutputRoot 'cache.version'
+$script:App.Version = '3.4.0'
+$cacheFormat = '3.4.0'   # bump when the generated HTML changes (note meta data, markup); forces one full conversion
+$script:App.ForceConvert = -not ((Test-Path -LiteralPath $cacheStamp) -and ((Get-Content -LiteralPath $cacheStamp -Raw -ErrorAction SilentlyContinue) -eq $cacheFormat))
+if ($script:App.ForceConvert) { try { Set-Content -LiteralPath $cacheStamp -Value $cacheFormat -NoNewline } catch { } }
 $script:App.NGram = [Math]::Max(1, (Get-Setting -Section Configuration -Key NGram -Default 3))
 $script:App.MaxCandidates = [Math]::Max(1, (Get-Setting -Section Configuration -Key MaxCandidates -Default 3))
 $script:App.ThresholdDefault = Get-Setting -Section Configuration -Key SimilarityThreshold -Default 0.25
 $script:App.ThresholdTitle = Get-Setting -Section Configuration -Key SimilarityThresholdTitle -Default $script:App.ThresholdDefault
 $script:App.ThresholdProcess = Get-Setting -Section Configuration -Key SimilarityThresholdProcess -Default $script:App.ThresholdDefault
 $script:App.ThresholdClipboard = Get-Setting -Section Configuration -Key SimilarityThresholdClipboard -Default 0.4
+# process name hits count less than window title hits: "Obsidian" as process must not beat the note named in the title
+$script:App.ProcessWeight = [Math]::Min(1.0, [Math]::Max(0.1, [double](Get-Setting -Section Configuration -Key ProcessWeight -Default 0.9)))
 $script:App.PollIntervalMs = [Math]::Max(200, (Get-Setting -Section Configuration -Key PollIntervalMs -Default 500))
 $script:App.ClipboardMaxChars = [Math]::Max(20, (Get-Setting -Section Configuration -Key ClipboardMaxChars -Default 400))
 $script:App.AutoCopyMinHoldMs = Get-Setting -Section Configuration -Key AutoCopyMinHoldMs -Default 200
@@ -627,6 +905,7 @@ $script:App.ShowMatchReason = Get-Setting -Section Configuration -Key ShowMatchR
 $script:App.MatchIgnoreFolders = @((Get-Setting -Section Configuration -Key MatchIgnoreFolders -Default '') -split ',' | ForEach-Object { $_.Trim().Trim('\', '/') -replace '/', '\' } | Where-Object { $_ })
 $script:App.CopyHistoryMax = [Math]::Max(0, (Get-Setting -Section Configuration -Key CopyHistory -Default 10))
 $script:App.ShowBacklinks = Get-Setting -Section Configuration -Key ShowBacklinks -Default $true
+$script:App.LinkPreview = Get-Setting -Section Configuration -Key LinkPreview -Default $true   # hover popup for internal links
 $script:App.WindowOpacity = [Math]::Min(1.0, [Math]::Max(0.3, [double](Get-Setting -Section Configuration -Key WindowOpacity -Default 0.92)))
 $script:App.InactiveOpacity = [Math]::Min(1.0, [Math]::Max(0.0, [double](Get-Setting -Section Configuration -Key InactiveOpacity -Default 0.0)))
 if ($script:App.InactiveOpacity -gt 0 -and $script:App.InactiveOpacity -lt 0.2) { $script:App.InactiveOpacity = 0.2 }   # never invisible
@@ -745,7 +1024,7 @@ function Initialize-Vault {
     }
 }
 
-Write-CSCLog ("Start v3.3.0 | Vaults={0} | Rules={1} | Language={2} | Debug={3} | Helper={4}" -f ($script:App.Vaults.Keys -join ','), $script:App.Rules.Count, $script:App.Language, $script:App.Debug, $script:HelperMode)
+Write-CSCLog ("Start v{5} | Vaults={0} | Rules={1} | Language={2} | Debug={3} | Helper={4}" -f ($script:App.Vaults.Keys -join ','), $script:App.Rules.Count, $script:App.Language, $script:App.Debug, $script:HelperMode, $script:App.Version)
 
 #endregion
 
@@ -810,7 +1089,7 @@ function Protect-CodeSegment {
     param([AllowEmptyString()][string]$Markdown, [AllowEmptyCollection()][System.Collections.Generic.List[string]]$Store)
     $patterns = @(
         '(?s)\A---\r?\n.*?\r?\n---[ \t]*(\r?\n|\z)',                          # front matter
-        '(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?^[ \t]{0,3}\1[ \t]*$',      # fenced code
+        '(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?^[ \t]{0,3}\1[ \t]*\r?$',   # fenced code (closing fence also with CR before LF)
         '``[^\n]*?``',                                                       # inline code with double backticks
         '`[^`\n]*`'                                                          # inline code
     )
@@ -909,6 +1188,77 @@ function Get-FrontmatterList {
     return $items.ToArray()
 }
 
+function ConvertTo-FrontmatterValue {
+    <# YAML scalar -> string, bool or number (quotes removed). #>
+    param([AllowEmptyString()][string]$Raw)
+    $v = $Raw.Trim()
+    if ($v -match '^"(.*)"$' -or $v -match "^'(.*)'$") { return $matches[1] }
+    if ($v -match '^(true|false)$') { return ($v -eq 'true') }
+    $d = 0.0
+    if ($v -match '^-?\d+(\.\d+)?$' -and [double]::TryParse($v, [System.Globalization.NumberStyles]::Float, [cultureinfo]::InvariantCulture, [ref]$d)) { return $d }
+    return $v
+}
+
+function ConvertFrom-FrontmatterSimple {
+    <# Flat YAML front matter -> ordered hashtable: scalars, inline lists [a, b] and dash lists. Nested maps become $null. #>
+    param([AllowEmptyString()][string]$Markdown)
+    $result = [ordered]@{}
+    $m = [regex]::Match($Markdown, '(?s)\A---\r?\n(.*?)\r?\n---[ \t]*(\r?\n|\z)')
+    if (-not $m.Success) { return $result }
+    $lines = @($m.Groups[1].Value -split '\r?\n')
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch '^([A-Za-z0-9_][^:#]*?)\s*:\s*(.*)$') { continue }
+        $key = $matches[1].Trim(); $val = $matches[2].Trim()
+        if ($val -match '^\[(.*)\]$') { $result[$key] = @($matches[1] -split ',' | ForEach-Object { $_.Trim().Trim('"', "'") } | Where-Object { $_ }) }
+        elseif ($val) { $result[$key] = ConvertTo-FrontmatterValue -Raw $val }
+        else {
+            $items = @(); $j = $i + 1
+            while ($j -lt $lines.Count -and $lines[$j] -match '^\s*-\s*(.*)$') { $items += $matches[1].Trim().Trim('"', "'"); $j++ }
+            if ($items.Count -gt 0) { $result[$key] = $items; $i = $j - 1 } else { $result[$key] = $null }
+        }
+    }
+    return $result
+}
+
+function Get-InlineFields {
+    <#
+        Dataview inline fields in the note body: "key:: value" at the start of a line (also inside %% comments and list
+        items) and "[key:: value]" / "(key:: value)" inside a line. Code blocks are skipped. Keys are stored as written
+        and normalised like Dataview does (lower case, spaces as dashes).
+    #>
+    param([AllowEmptyString()][string]$Markdown)
+    $fields = [ordered]@{}
+    if (-not $Markdown -or $Markdown.IndexOf('::') -lt 0) { return $fields }
+    $text = [regex]::Replace($Markdown, '(?ms)^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*\r?$', '')
+    $text = [regex]::Replace($text, '`[^`\r\n]*`', '')
+    $add = {
+        param($k, $v)
+        $k = $k.Trim(); if (-not $k) { return }
+        $val = ConvertTo-FrontmatterValue -Raw $v
+        $fields[$k] = $val
+        $norm = ($k.ToLowerInvariant() -replace '\s+', '-')
+        if ($norm -ne $k) { $fields[$norm] = $val }
+    }
+    foreach ($m in [regex]::Matches($text, '(?m)^[ \t]*(?:[-*+]\s+)?([A-Za-z][A-Za-z0-9_ -]*?)::[ \t]*(.*?)[ \t]*\r?$')) { & $add $m.Groups[1].Value $m.Groups[2].Value }
+    foreach ($m in [regex]::Matches($text, '[\[(]([A-Za-z][A-Za-z0-9_ -]*?)::[ \t]*([^\])\r\n]*)[\])]')) { & $add $m.Groups[1].Value $m.Groups[2].Value }
+    return $fields
+}
+
+function Get-NoteMetaScript {
+    <# Note meta data (file info, front matter, inline fields) as JSON inside the note HTML; app.js feeds it to dataviewjs blocks as dv.current(). #>
+    param([Parameter(Mandatory)]$Entry, [AllowEmptyString()][string]$Markdown)
+    $props = Get-InlineFields -Markdown $Markdown
+    $front = ConvertFrom-FrontmatterSimple -Markdown $Markdown
+    foreach ($k in $front.Keys) { $props[$k] = $front[$k] }   # front matter wins over inline fields with the same key
+    $meta = [ordered]@{
+        file        = [ordered]@{ name = $Entry.Name; path = ($Entry.Rel -replace '\\', '/'); folder = (($Entry.Folder -replace '\\', '/')); link = $Entry.Name; ext = 'md' }
+        frontmatter = $props
+        content     = $Markdown   # app.vault.read() of the current note inside dataviewjs
+    }
+    $json = (ConvertTo-Json -InputObject $meta -Compress -Depth 5) -replace '</', '<\/'
+    return '<script type="application/json" class="csc-note-meta">' + $json + '</script>' + "`n"
+}
+
 function Convert-Frontmatter {
     <# Optional: renders YAML front matter (key: value lines) as a collapsed properties box. #>
     param([AllowEmptyString()][string]$Markdown)
@@ -991,11 +1341,13 @@ function ConvertTo-NoteHtml {
     param([Parameter(Mandatory)]$Entry)
     try {
         $markdown = [System.IO.File]::ReadAllText($Entry.Full)
-        $front = Convert-Frontmatter -Markdown $markdown
+        $front = (Get-NoteMetaScript -Entry $Entry -Markdown $markdown) + (Convert-Frontmatter -Markdown $markdown)
         $markdown = Convert-ObsidianSyntax -Markdown $markdown -FromRelativePath $Entry.Rel
         $html = [Markdig.Markdown]::ToHtml($markdown, $script:MdPipeline)
         $html = Convert-Callout -Html $html
         $html = Resolve-HtmlResource -Html ($front + $html) -FromRelativePath $Entry.Rel
+        # notes with unresolved links are re-converted when files appear (index.cache)
+        if ($html.IndexOf('is-unresolved') -ge 0 -or $html.IndexOf('csc-missing') -ge 0) { $script:Index.Unresolved[$Entry.PathKey] = $true } else { $script:Index.Unresolved.Remove($Entry.PathKey) }
         $dir = Split-Path $Entry.Html -Parent
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         [System.IO.File]::WriteAllText($Entry.Html, $html, [System.Text.UTF8Encoding]::new($false))
@@ -1011,7 +1363,7 @@ function ConvertTo-NoteHtml {
 
 #region ---------- Vault index ----------
 
-$script:Index = @{ Entries = @(); Notes = @(); NoteNames = [string[]]@(); ByKey = @{}; ByPath = @{}; NotesByName = @{}; FilesByName = @{}; Backlinks = @{}; Signature = '' }
+$script:Index = @{ Entries = @(); Notes = @(); NoteNames = [string[]]@(); ByKey = @{}; ByPath = @{}; NotesByName = @{}; FilesByName = @{}; Backlinks = @{}; Signature = ''; Unresolved = @{} }
 
 function Get-BacklinkIndex {
     <#
@@ -1021,34 +1373,9 @@ function Get-BacklinkIndex {
         Needs $script:Index (Resolve-VaultLink), so it runs after the index was assigned.
     #>
     param([AllowEmptyCollection()][object[]]$Notes)
-    $map = @{}
-    $wiki = [regex]'!?\[\[([^\[\]\|#]*)(?:#[^\[\]\|]*)?(?:\\?\|[^\[\]]*)?\]\]'
-    $mdLink = [regex]'(?<!!)\[[^\]]*\]\(([^)\s]+?\.md)(?:#[^)]*)?\)'
-    foreach ($n in $Notes) {
-        if ([string]::IsNullOrWhiteSpace($n.Text)) { continue }
-        $text = [regex]::Replace($n.Text, '(?ms)^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$', '')
-        $text = [regex]::Replace($text, '`[^`\r\n]*`', '')
-        $seen = @{}
-        foreach ($line in ($text -split '\r?\n')) {
-            if ($line.IndexOf('[') -lt 0) { continue }
-            $targets = [System.Collections.Generic.List[string]]::new()
-            foreach ($m in $wiki.Matches($line)) { $targets.Add($m.Groups[1].Value) }
-            foreach ($m in $mdLink.Matches($line)) { $targets.Add($m.Groups[1].Value) }
-            foreach ($t in $targets) {
-                if ([string]::IsNullOrWhiteSpace($t)) { continue }
-                $entry = Resolve-VaultLink -Target $t -FromRelativePath $n.Rel
-                if ($null -eq $entry -or -not $entry.IsNote -or $entry.Key -eq $n.Key) { continue }
-                $lineKey = $entry.Key + '|' + $line
-                if ($seen.ContainsKey($lineKey)) { continue }   # several links to the same note in one line = one mention
-                $seen[$lineKey] = $true
-                if (-not $map.ContainsKey($entry.Key)) { $map[$entry.Key] = [ordered]@{} }
-                $bySource = $map[$entry.Key]
-                if (-not $bySource.Contains($n.Key)) { $bySource[$n.Key] = @{ Source = $n; Contexts = [System.Collections.Generic.List[string]]::new() } }
-                if ($bySource[$n.Key].Contexts.Count -lt 5) { $bySource[$n.Key].Contexts.Add($line.Trim()) }
-            }
-        }
-    }
-    return $map
+    # kept for tests and tools: the app itself uses VaultScanner.Backlinks (C#) with the same rules
+    if ($script:Index.Scan) { return [CheatSheetCompanionHelper.VaultScanner]::Backlinks($script:Index.Scan) }
+    return @{}
 }
 
 function Update-VaultIndex {
@@ -1061,66 +1388,32 @@ function Update-VaultIndex {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $root = $script:App.Vault
-    $ignore = $script:App.IgnoreFolders
-    $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object {
-        $rel = $_.FullName.Substring($root.Length + 1)
-        $parts = $rel -split '\\'
-        $skip = $false
-        if ($parts.Count -gt 1) { foreach ($p in $parts[0..($parts.Count - 2)]) { if ($ignore -contains $p) { $skip = $true; break } } }
-        -not $skip
-    }
-
-    $entries = [System.Collections.Generic.List[object]]::new()
-    $byKey = @{}; $byPath = @{}; $notesByName = @{}; $filesByName = @{}
-    foreach ($f in $files) {
-        $rel = $f.FullName.Substring($root.Length + 1)
-        $ext = $f.Extension.ToLowerInvariant()
-        $pathKey = ($rel -replace '\\', '/').ToLowerInvariant()
-        $isNote = ($ext -eq '.md')
-        $e = [pscustomobject]@{
-            Name      = $f.BaseName
-            Rel       = $rel
-            Full      = $f.FullName
-            Ext       = $ext
-            IsNote    = $isNote
-            IsImage   = ($script:App.ImageExtensions -contains $ext)
-            PathKey   = $pathKey
-            Key       = $(if ($isNote) { $pathKey.Substring(0, $pathKey.Length - 3) } else { $pathKey })
-            Html      = $(if ($isNote) { Join-Path $script:App.Output ($rel.Substring(0, $rel.Length - 3) + '.html') } else { $null })
-            LastWrite = $f.LastWriteTimeUtc
-            Display   = $f.BaseName
-            Folder    = (Split-Path $rel -Parent)
-            Text      = ''
-            Aliases   = @()
-            Matchable = $true     # false: MatchIgnoreFolders or front matter "csc: ignore" (still searchable)
-        }
-        $entries.Add($e)
-        $byPath[$pathKey] = $e
-        if ($isNote) {
-            $byKey[$e.Key] = $e
-            $n = $f.BaseName.ToLowerInvariant()
-            if (-not $notesByName.ContainsKey($n)) { $notesByName[$n] = [System.Collections.Generic.List[object]]::new() }
-            $notesByName[$n].Add($e)
-            try {
-                $e.Text = [System.IO.File]::ReadAllText($f.FullName)
-                $e.Aliases = @(Get-FrontmatterList -Markdown $e.Text -Key 'aliases')
-                if ($e.Text.StartsWith('---') -and $e.Text -match '(?s)\A---\r?\n(.*?)\r?\n---' -and $matches[1] -match '(?m)^csc(?:-match)?\s*:\s*(ignore|false|no|off)\s*$') { $e.Matchable = $false }
-            }
-            catch { }
-            foreach ($mi in $script:App.MatchIgnoreFolders) {
-                if ($e.Folder -and ($e.Folder -eq $mi -or $e.Folder.StartsWith($mi + '\', [StringComparison]::OrdinalIgnoreCase))) { $e.Matchable = $false; break }
-            }
-        }
-        $fn = $f.Name.ToLowerInvariant()
-        if (-not $filesByName.ContainsKey($fn)) { $filesByName[$fn] = [System.Collections.Generic.List[object]]::new() }
-        $filesByName[$fn].Add($e)
-    }
-    foreach ($kv in $notesByName.GetEnumerator()) {
-        if ($kv.Value.Count -gt 1) { foreach ($e in $kv.Value) { if ($e.Folder) { $e.Display = '{0} ({1})' -f $e.Name, $e.Folder } } }
-    }
+    # IgnoreFolders: plain names match any folder of that name at any depth, entries with a separator ("archive\old notes")
+    # match that relative path (and everything below it). They drop the NOTES there; images and other attachments in those
+    # folders stay known so embeds keep working (an "_attachments" entry is common). .obsidian, .trash and .git are skipped completely.
+    # The walk, the parallel reading of all notes (text, aliases, ignore flag, link targets) and the lookup maps are
+    # built in C# (VaultScanner); the entries are VaultEntry objects used like PSCustomObjects below.
+    $builtin = @('.obsidian', '.trash', '.git')
+    $ignoreNames = [string[]]@($script:App.IgnoreFolders | Where-Object { $_ -notmatch '[\\/]' -and $builtin -notcontains $_ })
+    $ignorePaths = [string[]]@($script:App.IgnoreFolders | Where-Object { $_ -match '[\\/]' })
+    $scan = [CheatSheetCompanionHelper.VaultScanner]::Scan($root, $ignoreNames, $ignorePaths, [string[]]@($script:App.MatchIgnoreFolders), $script:App.Output, [string[]]@($script:App.ImageExtensions))
+    $tScan = $sw.ElapsedMilliseconds
+    $entries = $scan.Entries
+    $byKey = $scan.ByKey; $byPath = $scan.ByPath; $notesByName = $scan.NotesByName; $filesByName = $scan.FilesByName
+    foreach ($e in $entries) { if ($e.Error) { Write-CSCLog ("Read failed for '{0}': {1}" -f $e.Rel, $e.Error) 'Warn' } }
+    $tRead = $sw.ElapsedMilliseconds
     $notes = @($entries | Where-Object IsNote | Sort-Object Display)
-    $signature = ($entries | ForEach-Object { $_.PathKey }) -join '|'
-    $fileSetChanged = ($signature -ne $script:Index.Signature)
+    $signature = $scan.Signature
+    # Output\<vault>\index.cache remembers the file set and the notes with unresolved links from the last run, so a
+    # start without changes converts nothing; a changed file set re-converts only notes whose links may resolve now
+    $cacheFile = Join-Path $script:App.Output 'index.cache'
+    $prev = $null
+    try { if (Test-Path -LiteralPath $cacheFile) { $prev = Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json } } catch { $prev = $null }
+    $prevSignature = if ($script:Index.Signature) { [string]$script:Index.Signature } elseif ($prev) { [string]$prev.Signature } else { '' }
+    $fileSetChanged = ($signature -ne $prevSignature)
+    $unresolved = @{}
+    if ($script:Index.Unresolved) { foreach ($u in $script:Index.Unresolved.Keys) { $unresolved[$u] = $true } }
+    elseif ($prev -and $prev.Unresolved) { foreach ($u in @($prev.Unresolved)) { $unresolved[[string]$u] = $true } }
 
     # match names: note name + front matter aliases, parallel array of entries
     $matchNames = [System.Collections.Generic.List[string]]::new()
@@ -1131,23 +1424,43 @@ function Update-VaultIndex {
         foreach ($a in $n.Aliases) { if ($a) { $matchNames.Add([string]$a); $matchEntries.Add($n) } }
     }
     $script:Index = @{
-        Entries = $entries.ToArray(); Notes = $notes; NoteNames = [string[]]($notes | ForEach-Object { $_.Name })
+        Entries = $entries; Notes = $notes; NoteNames = [string[]]($notes | ForEach-Object { $_.Name }); Scan = $scan
         MatchNames = $matchNames.ToArray(); MatchEntries = $matchEntries.ToArray()
-        ByKey = $byKey; ByPath = $byPath; NotesByName = $notesByName; FilesByName = $filesByName; Backlinks = @{}; Signature = $signature
+        ByKey = $byKey; ByPath = $byPath; NotesByName = $notesByName; FilesByName = $filesByName; Backlinks = @{}; Signature = $signature; Unresolved = $unresolved
     }
-    if ($script:App.ShowBacklinks) { $script:Index.Backlinks = Get-BacklinkIndex -Notes $notes }
+    $tPrep = $sw.ElapsedMilliseconds
+    if ($script:App.ShowBacklinks) { $script:Index.Backlinks = [CheatSheetCompanionHelper.VaultScanner]::Backlinks($scan) }
+    $tLinks = $sw.ElapsedMilliseconds
     if (-not $script:App.SearchContent) { foreach ($n in $notes) { $n.Text = '' } }   # aliases, ignore flag and backlinks are extracted above; the text itself is only needed for the content search
+    # parallel arrays for the C# search (display name, aliases, text), same order as Notes
+    $searchAliases = [string[][]]::new($notes.Count); $searchTexts = [string[]]::new($notes.Count); $searchDisplay = [string[]]::new($notes.Count)
+    for ($i = 0; $i -lt $notes.Count; $i++) {
+        $searchDisplay[$i] = [string]$notes[$i].Display
+        $searchAliases[$i] = [string[]]@(@($notes[$i].Aliases) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+        $searchTexts[$i] = [string]$notes[$i].Text
+    }
+    $script:Index.SearchDisplay = $searchDisplay; $script:Index.SearchAliases = $searchAliases; $script:Index.SearchTexts = $searchTexts
+    $tSearch = $sw.ElapsedMilliseconds
 
     $converted = 0
     foreach ($n in $notes) {
-        $needs = $Force -or $fileSetChanged -or -not (Test-Path -LiteralPath $n.Html) -or ((Get-Item -LiteralPath $n.Html).LastWriteTimeUtc -lt $n.LastWrite)
+        # one cheap .NET call per note (a missing file yields year 1601 and therefore converts)
+        $needs = $Force -or $script:App.ForceConvert -or ($fileSetChanged -and $unresolved.ContainsKey($n.PathKey)) -or ([System.IO.File]::GetLastWriteTimeUtc($n.Html) -lt $n.LastWrite)
         if ($needs) { if (ConvertTo-NoteHtml -Entry $n) { $converted++ } }
     }
+    $tConv = $sw.ElapsedMilliseconds
+    try {
+        $keep = @($notes | Where-Object { $script:Index.Unresolved.ContainsKey($_.PathKey) } | ForEach-Object { $_.PathKey })
+        ConvertTo-Json -InputObject @{ Signature = $signature; Unresolved = $keep } -Compress | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+    }
+    catch { Write-CSCLog "index.cache: $_" 'Warn' }
     $valid = @{}; foreach ($n in $notes) { $valid[$n.Html.ToLowerInvariant()] = $true }
     Get-ChildItem -LiteralPath $script:App.Output -Recurse -File -Filter '*.html' -ErrorAction SilentlyContinue | Where-Object { -not $valid.ContainsKey($_.FullName.ToLowerInvariant()) } | Remove-Item -Force -ErrorAction SilentlyContinue
 
     Write-CSCLog ("Index: {0} files, {1} notes ({2} excluded from matching), {3} converted, {4} ms" -f $entries.Count, $notes.Count, @($notes | Where-Object { -not $_.Matchable }).Count, $converted, $sw.ElapsedMilliseconds)
+    Write-CSCLog ("Index phases (ms): scan {0}, read {1}, prepare {2}, backlinks {3}, search arrays {4}, convert {5}, cleanup {6}" -f $tScan, ($tRead - $tScan), ($tPrep - $tRead), ($tLinks - $tPrep), ($tSearch - $tLinks), ($tConv - $tSearch), ($sw.ElapsedMilliseconds - $tConv))
     if ($converted -gt 0) { [GC]::Collect() }   # conversion garbage (Markdig, regex) would otherwise linger in an idle process
+    $script:App.ForceConvert = $false
     return $fileSetChanged
 }
 
@@ -1189,20 +1502,24 @@ function Find-NoteCandidates {
     foreach ($t in $Targets) {
         if ([string]::IsNullOrWhiteSpace($t.Text)) { continue }
         $matches = [CheatSheetCompanionHelper.Similarity]::TopMatches($names, [string]$t.Text, $script:App.NGram, [double]$t.Threshold, $Top * 2)
+        $weight = if ($t.Origin -eq 'process') { $script:App.ProcessWeight } else { 1.0 }
         foreach ($m in $matches) {
             $note = $script:Index.MatchEntries[$m.Index]
-            $reason = '{0}: {1} ({2})' -f (Get-OriginLabel $t.Origin), (ConvertTo-MatchReason -Code $m.Reason -MatchedName $names[$m.Index] -NoteName $note.Name), ([double]$m.Score).ToString('0.00', [cultureinfo]::InvariantCulture)
+            $score = [Math]::Round([double]$m.Score * $weight, 4)
+            $reason = '{0}: {1} ({2})' -f (Get-OriginLabel $t.Origin), (ConvertTo-MatchReason -Code $m.Reason -MatchedName $names[$m.Index] -NoteName $note.Name), $score.ToString('0.00', [cultureinfo]::InvariantCulture)
             if ($map.Contains($note.Key)) {
                 $c = $map[$note.Key]
-                if ($m.Score -gt $c.Score) { $c.Score = $m.Score }
+                if ($score -gt $c.Score) { $c.Score = $score; $c.MatchLength = $names[$m.Index].Length }
+                elseif ($score -eq $c.Score -and $names[$m.Index].Length -gt $c.MatchLength) { $c.MatchLength = $names[$m.Index].Length }
                 if ($c.Origins -notcontains $t.Origin) { $c.Origins += $t.Origin; $c.Reasons += $reason }
             }
             else {
-                $map[$note.Key] = [pscustomobject]@{ Entry = $note; Score = [double]$m.Score; Origins = @($t.Origin); Reasons = @($reason) }
+                $map[$note.Key] = [pscustomobject]@{ Entry = $note; Score = $score; Origins = @($t.Origin); Reasons = @($reason); MatchLength = $names[$m.Index].Length }
             }
         }
     }
-    return @($map.Values | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Entry.Name }; Descending = $false } | Select-Object -First $Top)
+    # equal scores: the longer matched name (most specific note) first, then alphabetical
+    return @($map.Values | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = 'MatchLength'; Descending = $true }, @{ Expression = { $_.Entry.Name }; Descending = $false } | Select-Object -First $Top)
 }
 
 function Get-RuleCandidates {
@@ -1223,36 +1540,22 @@ function Get-RuleCandidates {
 function Find-SearchResults {
     <#
         .SYNOPSIS
-        Quick switcher search: fuzzy on note names first, then full text (all tokens contained) with a snippet.
-        Returns objects: Entry, Kind ('name'|'content'), Score, Positions, Detail
+        Quick switcher search over note names, aliases and contents, one result per note (its best hit).
+        Scores: substring hit in name/alias >= 1000, content hit (all tokens contained) 500, fuzzy subsequence hit below.
+        Returns objects: Entry, Kind ('name'|'alias'|'content'), Score, Positions, Detail
     #>
     param([Parameter(Mandatory)][string]$Query)
     $q = $Query.Trim()
     if (-not $q) { return @() }
     $max = $script:App.SearchMaxResults
-    $results = [System.Collections.Generic.List[object]]::new()
-    foreach ($n in $script:Index.Notes) {
-        $m = [CheatSheetCompanionHelper.Fuzzy]::Match($q, $n.Display)
-        if ($null -ne $m) { $results.Add([pscustomobject]@{ Entry = $n; Kind = 'name'; Score = $m.Score; Positions = $m.Positions; Detail = $n.Folder }) }
-    }
-    $sorted = [System.Collections.Generic.List[object]]@($results | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Entry.Display } } | Select-Object -First $max)
-    if ($sorted.Count -lt $max) {
-        $tokens = @($q.ToLowerInvariant() -split '\s+' | Where-Object { $_ })
-        $seen = @{}; foreach ($r in $sorted) { $seen[$r.Entry.PathKey] = $true }
-        $content = [System.Collections.Generic.List[object]]::new()
-        foreach ($n in $script:Index.Notes) {
-            if ($seen.ContainsKey($n.PathKey) -or -not $n.Text) { continue }
-            $first = -1; $ok = $true
-            foreach ($t in $tokens) { $i = $n.Text.IndexOf($t, [StringComparison]::OrdinalIgnoreCase); if ($i -lt 0) { $ok = $false; break }; if ($first -lt 0 -or $i -lt $first) { $first = $i } }
-            if (-not $ok) { continue }
-            $start = [Math]::Max(0, $first - 30)
-            $len = [Math]::Min(90, $n.Text.Length - $start)
-            $snippet = ($n.Text.Substring($start, $len) -replace '\s+', ' ').Trim()
-            $content.Add([pscustomobject]@{ Entry = $n; Kind = 'content'; Score = 1.0 - ($first * 0.00001); Positions = @(); Detail = $(if ($start -gt 0) { '…' } else { '' }) + $snippet + '…' })
-        }
-        foreach ($r in ($content | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Entry.Display } } | Select-Object -First ($max - $sorted.Count))) { $sorted.Add($r) }
-    }
-    return @($sorted)
+    if ($null -eq $script:Index.SearchDisplay -or $script:Index.SearchDisplay.Count -eq 0) { return @() }
+    # the whole pass runs in C# (thousands of notes per keystroke), PowerShell only wraps the few hits
+    $hits = [CheatSheetCompanionHelper.SearchEngine]::Find($script:Index.SearchDisplay, $script:Index.SearchAliases, $script:Index.SearchTexts, $q, $max)
+    $kinds = @('name', 'alias', 'content')
+    return @($hits | ForEach-Object {
+            $n = $script:Index.Notes[$_.Index]
+            [pscustomobject]@{ Entry = $n; Kind = $kinds[$_.Kind]; Score = $_.Score; Positions = $_.Positions; Detail = $(if ($_.Kind -eq 0) { $n.Folder } else { $_.Detail }) }
+        })
 }
 
 #endregion
@@ -1374,7 +1677,7 @@ function Get-BacklinksHtml {
     if (-not $script:App.ShowBacklinks) { return '' }
     $map = $script:Index.Backlinks
     if ($null -eq $map -or -not $map.ContainsKey($Entry.Key)) { return '' }
-    $sources = @($map[$Entry.Key].Values | Sort-Object { $_.Source.Display })
+    $sources = @($map[$Entry.Key] | Sort-Object { $_.Source.Display })
     if ($sources.Count -eq 0) { return '' }
     $sb = [System.Text.StringBuilder]::new()
     foreach ($s in $sources) {
@@ -1433,8 +1736,9 @@ function New-ViewHtml {
         dblClickEdit = [string]$script:App.EditOnDoubleClick
         anchor = $Anchor
         activeIndex = $ActiveIndex
-        text = @{ copy = (Get-Text 'page.copy'); copied = (Get-Text 'page.copied'); copyCode = (Get-Text 'page.copyCode'); copyAgain = (Get-Text 'page.copyAgain') }
+        text = @{ copy = (Get-Text 'page.copy'); copied = (Get-Text 'page.copied'); copyCode = (Get-Text 'page.copyCode'); copyAgain = (Get-Text 'page.copyAgain'); dataviewOnly = (Get-Text 'page.dataviewOnly'); dataviewFailed = (Get-Text 'page.dataviewFailed') }
         copyHistory = @(Get-CopyHistoryItems)
+        linkPreview = [bool]$script:App.LinkPreview
     } | ConvertTo-Json -Compress -Depth 4
     $legend = '<div class="csc-legend">' + $(if ($hasPinned) { '<span><span class="dot pinned"></span>' + (ConvertTo-HtmlAttribute (Get-Text 'origin.pinned')) + '</span>' }) +
     '<span><span class="dot title"></span>' + (ConvertTo-HtmlAttribute (Get-Text 'origin.title')) + '</span><span><span class="dot process"></span>' + (ConvertTo-HtmlAttribute (Get-Text 'origin.process')) + '</span><span><span class="dot clipboard"></span>' + (ConvertTo-HtmlAttribute (Get-Text 'origin.clipboard')) + '</span></div>'
@@ -2398,7 +2702,7 @@ function New-SearchItem {
         $detail.FontSize = 11
         $detail.TextTrimming = 'CharacterEllipsis'
         $detail.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, 'CscMutedFg')
-        $detail.Text = $(if ($Result.Kind -eq 'content') { Get-Text 'ui.contentPrefix' } else { '' }) + [string]$Result.Detail
+        $detail.Text = $(switch ($Result.Kind) { 'content' { Get-Text 'ui.contentPrefix' } 'alias' { Get-Text 'ui.aliasPrefix' } default { '' } }) + [string]$Result.Detail
         [void]$panel.Children.Add($detail)
     }
     $item.Content = $panel
@@ -2580,6 +2884,19 @@ function Initialize-WebViewCore {
                             if (Set-ClipboardTextSafe -Text ([string]$hist[$k].Text)) { Set-Status (Get-Text 'status.recopied' -Format (Get-CopyHistoryLabel -Text ([string]$hist[$k].Text) -Max 50)) }
                         }
                     }
+                    'preview' {
+                        # hover popup: the rendered target note (embeds resolved) goes back to the page, which shows it next to the link
+                        if ($script:App.LinkPreview -and $msg.rel) {
+                            Write-CSCLog ("Preview request {0}: {1}" -f [string]$msg.id, [string]$msg.rel)
+                            $entry = $script:Index.ByPath[(([string]$msg.rel) -replace '\\', '/').ToLowerInvariant()]
+                            if ($entry -and $entry.IsNote) {
+                                $html = Get-NoteViewHtml -Entry $entry   # keeps the note meta data, so dataviewjs blocks work in the popup too
+                                if ($html.Length -gt 400000) { $html = $html.Substring(0, 400000) }
+                                $json = ConvertTo-Json -InputObject @{ id = [string]$msg.id; title = $entry.Display; rel = $entry.Rel; anchor = [string]$msg.anchor; html = $html } -Compress -Depth 3
+                                $null = $script:UI.WebView.CoreWebView2.ExecuteScriptAsync('if(window.CSC_showPreview){window.CSC_showPreview(' + $json + ');}')
+                            }
+                        }
+                    }
                     'openNote' {
                         $entry = $null
                         if ($msg.rel) { $entry = $script:Index.ByPath[(([string]$msg.rel) -replace '\\', '/').ToLowerInvariant()] }
@@ -2596,6 +2913,7 @@ function Initialize-WebViewCore {
                     'back' { Invoke-ViewBack }
                     'forward' { Invoke-ViewForward }
                     'copyFormatted' { Copy-NoteContent }
+                    'log' { Write-CSCLog ('Page: ' + [string]$msg.text) }
                     'ready' { }
                 }
             }
@@ -2927,11 +3245,16 @@ $window.FindName('btnEditMarkdown').ToolTip = (Get-Text 'ui.edit') + $dblHint
 $window.FindName('btnAddMarkdown').Add_Click({ New-NoteForCurrentContext })
 
 # --- search box + popup ---
+# typing is debounced: the search runs 80 ms after the last keystroke instead of on every one
+$searchDebounce = [System.Windows.Threading.DispatcherTimer]::new()
+$searchDebounce.Interval = [TimeSpan]::FromMilliseconds(80)
+$searchDebounce.Add_Tick({ param($s, $e) $s.Stop(); try { Update-SearchPopup -Query $script:UI.SearchBox.Text } catch { Write-CSCLog "Search: $_" 'Warn' } })
+$script:UI.SearchDebounce = $searchDebounce
 $script:UI.SearchBox.Add_TextChanged({
         param($s, $e)
         $script:UI.SearchHint.Visibility = $(if ([string]::IsNullOrEmpty($s.Text)) { 'Visible' } else { 'Collapsed' })
         if ($script:UI.SuppressSearchEvents) { return }
-        try { Update-SearchPopup -Query $s.Text } catch { Write-CSCLog "Search: $_" 'Warn' }
+        $script:UI.SearchDebounce.Stop(); $script:UI.SearchDebounce.Start()
     })
 $script:UI.SearchBox.Add_PreviewKeyDown({
         param($s, $e)
